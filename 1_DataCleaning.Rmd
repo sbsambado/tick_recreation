@@ -1,0 +1,1285 @@
+---
+title: "Data Cleaning"
+output: html_document
+date: "2025-09-25"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## upload necessary packages
+library(sf)
+library(terra)
+library(tidyverse)
+library(ggplot2)  
+library(tigris)
+library(ggrepel)
+library(osmdata)
+library(biscale)
+library(cowplot)
+library(data.table)
+library(leaflet)
+library(RColorBrewer)
+library(slippymath)
+library(janitor)
+
+## upload tick predictions
+tick_year_inf <- rast("data/raw/ticks/ipac_year_infection_predictions.tif")
+tick_year_presence <- rast("data/raw/ticks/ipac_year_suitability_predictions.tif")
+# tick_month_presence is below in a function
+
+```
+
+#Park Info 
+
+A. Upload boundaries
+```{r}
+# california shp
+ca_shp <- counties(state = "CA", cb = TRUE, class = "sf")
+
+# california state parks shp (casp)
+casp_shp <- st_read("data/raw/parks/casp_individualpark_boundaries/ParkBoundaries.shp")
+
+# california district & division shp
+casp_districtdivision_shp <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp")
+
+
+# make sure northern field division is the same
+casp_districtdivision_shp <- casp_districtdivision_shp %>% 
+  mutate(field_divi = case_when(field_divi == "Northern Field Division" ~ "Northern Field Division",
+                                field_divi == "Nothern Field Division" ~ "Northern Field Division",
+                                TRUE ~ field_divi))
+
+```
+
+B. Select certain parks
+```{r}
+### Select for parks that are more likely to have recreation
+casp_shp_select <- casp_shp %>% # 462 original parks
+  filter(grepl(" SP", UNITNAME) |
+           grepl(" SRA", UNITNAME) |
+           grepl(" SB", UNITNAME) |
+           grepl(" SNR", UNITNAME) |
+           grepl(" SW", UNITNAME)) # 254 select parks
+
+### Add metadata to which districts and divisions the select parks belong to
+
+# correct crs
+casp_shp_select_crs <- st_transform(casp_shp_select, st_crs(casp_districtdivision_shp))  
+
+# if parks overlap multiple districts, st_intersects is better than st_within
+casp_shp_select_crs <- st_join(casp_shp_select_crs, casp_districtdivision_shp, join = st_intersects) 
+
+# checked which parks were na filter(is.na(field_divi)) 
+casp_shp_select_crs <- casp_shp_select_crs %>% 
+  mutate(field_divi = case_when(UNITNAME == "Cardiff SB" ~ "Coastal Field Division",
+                                UNITNAME == "Manchester SP" ~ "Nothern Field Division",
+                                UNITNAME == "Silver Strand SB" ~ "Coastal Field Division",
+                                TRUE ~ field_divi),
+         district = case_when(UNITNAME == "Cardiff SB" ~ "San Diego Coast District",
+                              UNITNAME == "Manchester SP" ~ "Sonoma-Mendocino Coast District",
+                              UNITNAME == "Silver Strand SB" ~ "San Diego Coast District",
+                              TRUE ~ district)) 
+
+
+casp_shp_clean <- casp_shp_select_crs %>% 
+  dplyr::select(UNITNAME, Shape_Area, field_divi, district, geometry) 
+```
+
+
+C. Calculate distance from park centroid to coast
+```{r}
+## get coastline of ca
+ca_osm <- getbb(place_name = "California") %>% 
+  opq() %>% # creates overpass API query
+  add_osm_feature(key = "natural", value = "coastline") %>% 
+  osmdata_sf() # return as sf object
+
+# clean up coastline data
+coastlines <- ca_osm$osm_lines %>% 
+  st_simplify(dTolerance = 0.01) %>%  # reduce complexity 
+  st_union() %>% # merge into cont geometry
+  st_cast('LINESTRING') # helps for calculations
+
+
+## set up parks shp data
+casp_shp_sf <- casp_shp %>% 
+  st_transform(crs = 4326) %>%
+  st_make_valid()
+
+# extract bbox of each feature
+casp_shp_bbox <- do.call(rbind, lapply(st_geometry(casp_shp_sf), st_bbox)) %>% 
+  as.data.frame()
+
+# combine bbox data with shp data
+casp_shp_trans <- bind_cols(casp_shp_sf,casp_shp_bbox)
+
+# calc centroids
+casp_shp_cent <- st_centroid(casp_shp_trans)
+
+# to calculate distances convert for meters
+casp_shp_cent_proj <- st_transform(casp_shp_cent, crs = 3310)
+coastlines_proj <- st_transform(coastlines, crs = 3310)
+
+# calc distance from centroids to coastline
+distances <- st_distance(casp_shp_cent_proj, coastlines_proj)
+
+# extract min distance for each feature
+min_distance <- apply(distances, 1, min) # in meters
+
+min_distance_km <- min_distance/1000
+
+## adad back to spatial data
+casp_shp_sf$dist_coast_km <- min_distance_km
+
+# casp_shp_sf %>% st_drop_geometry() %>% write.csv("data/processed/casp_dist_coast_km.csv")
+
+
+```
+
+#Tick Info
+
+A. Extract **infected** tick suitability predictions per park
+(does this make sense to take the mean of binary outcome?)
+```{r}
+#plot(tick_year_inf)
+
+# fix crs
+casp_shp_vect <- casp_shp_clean %>% 
+  st_make_valid() %>% 
+  st_simplify(dTolerance = 0.001, preserveTopology = TRUE) %>% 
+  st_transform(crs = crs(tick_year_inf)) %>% 
+  vect()
+
+# extract predictions per park
+tick_inf_means <- terra::extract(tick_year_inf, casp_shp_vect, fun = mean, na.rm = TRUE)
+
+# make into dataframe
+casp_tick_df <- bind_cols(as.data.frame(casp_shp_vect), tick_inf_means)
+names(casp_tick_df)[6] <- "tick_year_inf_prob"
+
+
+casp_tick_inf_distinct <- casp_tick_df %>% 
+  distinct(UNITNAME, .keep_all = TRUE) %>% 
+  rename(tick_year_inf = tick_year_inf_prob ) %>% 
+  dplyr::select(UNITNAME, tick_year_inf)
+```
+
+
+B. Extract **presence** tick predictions per park (year)
+```{r}
+#plot(tick_year_presence)
+
+# fix crs
+casp_shp_vect_suit <- casp_shp_clean %>% 
+  st_make_valid() %>% 
+  st_simplify(dTolerance = 0.001, preserveTopology = TRUE) %>% 
+  st_transform(crs = crs(tick_year_presence)) %>% 
+  vect()
+
+# extract predictions per park
+tick_presence_means <- terra::extract(tick_year_presence, casp_shp_vect_suit, fun = mean, na.rm = TRUE)
+
+# make into dataframe
+casp_tick_suit_df <- bind_cols(as.data.frame(casp_shp_vect_suit), tick_presence_means)
+names(casp_tick_suit_df)[6] <- "tick_year_presence_prob"
+
+
+## select for distinct
+casp_tick_suit_distinct <- casp_tick_suit_df %>% 
+  distinct(UNITNAME, .keep_all = TRUE) %>% 
+  rename(tick_year_presence = tick_year_presence_prob ) %>% 
+  dplyr::select(UNITNAME, tick_year_presence)
+```
+
+
+C. Extract **presence** tick predictions per park (month)
+```{r}
+## write function to call in all tiff files
+tick_month_tiff <- list.files("data/raw/ticks/ipac_month_suitability_predictions/", full.names = TRUE)
+month_names <- month.abb[1:length(tick_month_tiff)]
+
+## fix park crs
+sample_rast <- rast(tick_month_tiff[1])
+
+casp_shp_vect_suit_monthly <- casp_shp_clean %>% 
+  st_make_valid() %>% 
+  st_simplify(dTolerance = 0.001, preserveTopology = TRUE) %>% 
+  st_transform(crs = crs(sample_rast)) %>% 
+  vect()
+
+## loop through all months to extract mean presence suitability per park
+casp_tick_monthly_suit <- map2_dfr(.x = tick_month_tiff, .y = month_names,
+                                   .f = function(tif, month) {
+                                     rast_month <- rast(tif)
+                                     
+                                     means <- terra::extract(rast_month, casp_shp_vect_suit_monthly, fun = mean, na.rm = TRUE)
+                                     
+                                     # add park name
+                                     df <- as.data.frame(means)
+                                     df$UNITNAME <- casp_shp_vect_suit_monthly$UNITNAME
+                                     df$month <- month
+                                     colnames(df)[2] <- "tick_monthly_suitability"
+                                     
+                                     return(df[, c("UNITNAME", "month", "tick_monthly_suitability")])
+                                   })
+
+
+casp_tick_monthly_suit$month <- factor(casp_tick_monthly_suit$month, levels = month.abb)
+
+#write.csv(casp_tick_monthly_suit, file = "data/processed/casp_tick_monthly_suit_long.csv")
+
+casp_tick_monthly_suit_long <- read.csv("data/processed/casp_tick_monthly_suit_long.csv")
+
+casp_tick_monthly_suit_distinct <- casp_tick_monthly_suit_long  %>%
+  mutate(month = factor(month, levels = month.abb),
+         month_num = as.numeric(month)) %>% 
+  dplyr::select(UNITNAME, month_num,tick_monthly_suitability) %>% 
+  rename(tick_monthly_presence = tick_monthly_suitability,
+         month = month_num) %>% 
+  distinct(UNITNAME, month, .keep_all = TRUE)
+
+## make long
+casp_tick_monthly_suit_wide <- casp_tick_monthly_suit %>% 
+  group_by(UNITNAME, month) %>%
+  summarise(tick_monthly_suitability = mean(tick_monthly_suitability, na.rm = TRUE), .groups = "drop") %>% 
+  pivot_wider(names_from = month,
+              values_from = tick_monthly_suitability,
+              names_prefix = "tick_month_presence_suit_")
+```
+
+D. Combine all tick extractions per park
+```{r}
+## combine all data
+# this is dropping down to 221 parks NEED TO FIX
+casp_tick_allextractions <- casp_tick_df %>%
+  select(UNITNAME, tick_year_inf_prob) %>%
+  inner_join(casp_tick_suit_df %>% select(UNITNAME, tick_year_presence_prob),by = "UNITNAME") %>%
+  # Join monthly wide suitability
+  left_join(casp_tick_monthly_suit_wide, by = "UNITNAME") %>%
+  # remove duplicates
+  group_by(UNITNAME) %>%
+  summarise(across(where(is.numeric), ~mean(.x, na.rm = TRUE)),.groups = "drop")
+
+#write.csv(casp_tick_allextractions, file = "data/processed/casp_tick_allextractions.csv")
+```
+
+
+#Human Info
+
+##Flickr
+```{r}
+
+plan(multisession)
+
+api_key <- "4288cfbc0c862c18491a006f294fb2c3"
+url <- "https://api.flickr.com/services/rest/"
+min_date <- "2021-01-01"
+max_date <- "2023-12-31"
+search_text <- "street"
+
+# right projec
+casp_trans <- st_transform(casp_shp, 4326)
+
+# vectorized bbox for extraction
+bbox_list <- lapply(st_geometry(casp_trans), st_bbox)
+bbox_df <- do.call(rbind, lapply(bbox_list, function(x) as.data.frame(as.list(x))))
+
+# combine with original data
+bbox_casp_df <- casp_trans %>% 
+  st_drop_geometry() %>% 
+  bind_cols(bbox_df) %>% 
+  rename("park_name" = "UNITNAME")
+
+# add .5 degree buffer to bounding boxes
+
+parks_df <- bbox_casp_df %>%  
+  mutate(xmin_buffered = xmin - 0.5,
+         ymin_buffered = ymin - 0.5,
+         xmax_buffered = xmax + 0.5,
+         ymax_buffered = ymax + 0.5,
+         bbox = paste(xmin_buffered, ymin_buffered, xmax_buffered, ymax_buffered, sep = ","))
+
+
+## parallel function
+fetch_photos_for_park <- function(park_row) {
+  park_name <- park_row$park_name
+  bbox <- park_row$bbox
+  
+  message("Processing park: ", park_name)
+  
+  
+  # Initial API call to get total pages
+  initial_response <- GET(url, query = list(
+    method = "flickr.photos.search",
+    api_key = api_key,
+    format = "json",
+    nojsoncallback = 1,
+    bbox = bbox,
+    text = search_text,
+    page = 1,
+    per_page = 500,
+    min_taken_date = min_date,
+    max_taken_date = max_date,
+    sort = "date-taken-desc",
+    extras = "geo,date_taken,tags"))
+  
+  
+  if (http_error(initial_response)) return(NULL)
+  
+  initial_data <- fromJSON(content(initial_response, as = "text"))
+  photos <- initial_data$photos
+  total_pages <- min(photos$pages, 5)
+  total <- as.integer(photos$total)
+  
+  
+  # Skip looping if only 1 page or few results
+  pages_to_fetch <- if (total <= 500) 1 else total_pages
+  
+  park_photos <- list()
+  for (p in seq_len(pages_to_fetch)) {
+    message("  Page ", p)
+    
+    resp <- GET(url, query = list(
+      method = "flickr.photos.search",
+      api_key = api_key,
+      format = "json",
+      nojsoncallback = 1,
+      bbox = bbox,
+      text = search_text,
+      page = p,
+      per_page = 500,
+      min_taken_date = min_date,
+      max_taken_date = max_date,
+      sort = "date-taken-desc",
+      extras = "geo,date_taken,tags"))
+    
+    if (http_error(resp)) next
+    data <- fromJSON(content(resp, as = "text"))
+    park_photos[[p]] <- data$photos$photo
+    
+    Sys.sleep(runif(1, 0.5, 1.5))  # small random delay to avoid rate-limiting
+  }
+  
+  # Combine and format results
+  all_photos <- bind_rows(park_photos)
+  
+  if (nrow(all_photos) == 0) return(NULL)
+  
+  all_photos %>%
+    mutate(date = ymd(substr(datetaken, 1, 10)),
+           photo_url = paste0("https://farm", farm, ".staticflickr.com/", server, "/", id, "_", secret, ".jpg"),
+      park = park_name)
+}
+
+
+
+# Run in parallel over all parks
+all_parks_photos <- future_map(
+  split(parks_df, seq_len(nrow(parks_df))),
+  fetch_photos_for_park,
+  .progress = TRUE
+)
+
+# Remove NULLs (failed parks)
+all_parks_photos <- compact(all_parks_photos)
+
+# Combine into single dataframe
+photos_df_all <- bind_rows(all_parks_photos)
+
+
+## this has just 2021-2023 data in it  (was photos_df_all_20212023.csv)
+write.csv(photos_df_all, "data/raw/recreation/flickr/flickr_21to23_nondistinct.csv", row.names = FALSE)
+
+## old fnction had different dates this was 2025-2021 (was "photos_df_all_20250831.csv")
+#write.csv(photos_df_all, "data/raw/recreation/flickr/flickr_21to25_nondistinct.csv")
+```
+
+^^^ bc flickr goes backwards it selects photos from most recent year and goes down until it hits its limit
+
+Wrangle the pulled down data into years that are needed
+```{r}
+# just select 2024 data and keep only distinct observations
+flickr_distinct_2024 <- read.csv("data/raw/recreation/flickr/flickr_21to25_nondistinct.csv") %>% 
+  mutate(year = as.numeric(substr(date, 1, 4)),
+          month = as.numeric(substr(date, 6, 7))) %>% 
+  #distinct(park,date , owner, .keep_all = TRUE) %>% # 25,868 × 28 %>% # was month
+  dplyr::select(park, year, month, date, latitude, longitude, owner) %>% 
+   filter(year == 2024) # 47,398
+
+
+## select distinct photos from 2023 to 2021
+ flickr_distinct_20212023 <- read.csv("data/raw/recreation/flickr/flickr_21to23_nondistinct.csv") %>% 
+  mutate(year = as.numeric(substr(date, 1, 4)),
+          month = as.numeric(substr(date, 6, 7))) %>% 
+  #distinct(park, date, owner, .keep_all = TRUE) %>% # 25,868 × 28 %>%  # was month
+  dplyr::select(park, year, month, date, latitude, longitude, owner) 
+
+ 
+# combine distinct flickr data
+flickr_distinct_20212024 <- rbind(flickr_distinct_20212023, flickr_distinct_2024) #175,472
+
+#write.csv(flickr_distinct_20212024, file = "data/processed/flickr_21to24_notdistinct.csv") # omitted _date when it was month
+
+## make dataset to merge for monthly dataframe
+
+
+flickr_distinct_20212024_calc <- flickr_distinct_20212024 %>% 
+  mutate(date = ymd(date)) %>% 
+  distinct(park, date, owner, .keep_all = TRUE)  %>% 
+  group_by(park, year, month, date) %>% 
+  summarise(daily_uniqueusers = n(), .groups = "drop") %>% 
+  group_by(park, year, month) %>% 
+  summarise(monthly_usertotal = sum(daily_uniqueusers), .groups = "drop") %>% 
+  group_by(park, month) %>% 
+  summarise(mean_monthly_usertotal = mean(monthly_usertotal), .groups = "drop") %>% 
+    filter(grepl(" SP", park) |
+           grepl(" SRA", park) |
+           grepl(" SB", park) |
+           grepl(" SNR", park) |
+           grepl(" SW", park)) %>% 
+  rename(UNITNAME = park)
+
+
+## make sure every park has months 1-12
+flickr_distinct_20212024_df <- flickr_distinct_20212024_calc %>% 
+  complete(UNITNAME, month = 1:12, fill = list(mean_monthly_usertotal = 0)) %>% 
+  rename(flickr_monthly_uniquetotals = mean_monthly_usertotal)
+
+#write.csv(flickr_distinct_20212024_df, file = "data/processed/flickr_21to24_distinct_v2.csv") 
+```
+
+##GBIF
+
+Download data for 
+- bbox around all of my parks (instead of individual polygons)
+- years 2021, 2022, 2023 (but do them individually to make easier to manipulate data)
+- only human observations, with coordinates, present only records, 
+
+Pull down data
+```{r}
+## API
+#Sys.setenv(GBIF_USER = "sbsambado")
+#Sys.setenv(GBIF_PWD = "2411ucsb")
+#Sys.setenv(GBIF_EMAIL = "sbsambado@ucsb.edu")
+
+
+## correct CRS
+casp_shp_gbif <- casp_shp_clean %>% 
+  st_transform(crs = 4326) %>% 
+  st_make_valid()
+
+# get bbox
+casp_shp_bbox <- st_bbox(casp_shp_gbif)
+
+# make valid WKT for gbif
+casp_shp_wkt <- sprintf("POLYGON((%f %f, %f %f, %f %f, %f %f, %f %f))",
+  casp_shp_bbox ["xmin"], casp_shp_bbox ["ymin"],
+  casp_shp_bbox ["xmax"], casp_shp_bbox ["ymin"],
+  casp_shp_bbox ["xmax"], casp_shp_bbox ["ymax"],
+  casp_shp_bbox ["xmin"], casp_shp_bbox ["ymax"],
+  casp_shp_bbox ["xmin"], casp_shp_bbox ["ymin"])
+
+
+### Pull down data
+
+## 2021 
+gbif_download_2021 <- occ_download(
+  pred_and(
+    pred("geometry", casp_shp_wkt),
+    pred("year", 2021),
+    pred("hasCoordinate", TRUE), 
+    pred("occurrenceStatus", "PRESENT"),
+    pred("basisOfRecord", "HUMAN_OBSERVATION")),
+  format = "SIMPLE_CSV")
+
+occ_download_wait('0007749-250827131500795') # check status 
+occ_download_get('0007749-250827131500795', overwrite = TRUE)
+# NEED TO FIX file path
+#unzip("/Users/sbsambado/scratch/0007749-250827131500795.zip", exdir = "gbif_2021_data")
+
+
+## 2022 
+gbif_download_2022 <- occ_download(
+  pred_and(
+    pred("geometry", casp_shp_wkt),
+    pred("year", 2022),
+    pred("hasCoordinate", TRUE), 
+    pred("occurrenceStatus", "PRESENT"),
+    pred("basisOfRecord", "HUMAN_OBSERVATION")),
+  format = "SIMPLE_CSV")
+
+occ_download_get('0008181-250827131500795', overwrite = TRUE)
+# NEED TO FIX file path
+#unzip("/Users/sbsambado/scratch/0008181-250827131500795.zip", exdir = "ticks_recreation/gbif_2022_data")
+
+## 2023
+ gbif_download_2023 <- occ_download(
+   pred_and(
+     pred("geometry", casp_shp_wkt),
+     pred("year", 2023),
+     pred("hasCoordinate", TRUE), 
+     pred("occurrenceStatus", "PRESENT"),
+     pred("basisOfRecord", "HUMAN_OBSERVATION")),
+   format = "SIMPLE_CSV")
+
+occ_download_get('0008188-250827131500795', overwrite = TRUE)
+# NEED TO FIX file path
+#unzip("/Users/sbsambado/scratch/0008188-250827131500795.zip", exdir = "gbif_2023_data")
+
+```
+
+Wrangle data
+```{r}
+## upload data
+gbif_data_2021 <- fread("data/raw/recreation/gbif/gbif_2021_data/0007749-250827131500795.csv", 
+                   select = c("scientificName", "decimalLatitude", "decimalLongitude", 
+                              "eventDate", "basisOfRecord", "recordedBy"))
+
+
+gbif_data_2022 <- fread("data/raw/recreation/gbif/gbif_2022_data/0008181-250827131500795.csv", 
+                   select = c("scientificName", "decimalLatitude", "decimalLongitude", 
+                              "eventDate", "basisOfRecord", "recordedBy"))
+
+gbif_data_2023 <- fread("data/raw/recreation/gbif/gbif_2023_data/0008188-250827131500795.csv", 
+                   select = c("scientificName", "decimalLatitude", "decimalLongitude", 
+                              "eventDate", "basisOfRecord", "recordedBy"))
+
+
+### extract observations per park per year
+## create a spatial buffer of parks
+casp_shp_gbif_buffer <- casp_shp_clean %>% 
+  st_make_valid() %>% 
+  st_transform(crs = 4326) %>% 
+  st_simplify(dTolerance = 0.001, preserveTopology = TRUE) %>% 
+  st_buffer(dist = 0.0005) # 50 meters 
+  
+
+## convert gbif points to sf 
+gbif_2021_sf <- st_as_sf(gbif_data_2021,
+                         coords = c("decimalLongitude", "decimalLatitude"),
+                         crs = 4326, remove = FALSE) %>%  # keep lat, lon columns
+  filter(!is.na(decimalLongitude) & !is.na(decimalLatitude))
+
+gbif_2022_sf <- st_as_sf(gbif_data_2022,
+                         coords = c("decimalLongitude","decimalLatitude"),
+                         crs = 4326, remove = FALSE) %>%  # keep lat, lon columns
+  filter(!is.na(decimalLongitude) & !is.na(decimalLatitude))
+
+gbif_2023_sf <- st_as_sf(gbif_data_2023,
+                         coords = c("decimalLongitude", "decimalLatitude"),
+                         crs = 4326, remove = FALSE) %>%  # keep lat, lon columns
+  filter(!is.na(decimalLongitude) & !is.na(decimalLatitude))
+
+## spatial join
+# this is slightly different from prior attempt when i used st_within
+casp_gbif_2021_sf <- st_join(gbif_2021_sf, casp_shp_gbif_buffer, join = st_intersects, left = FALSE ) 
+casp_gbif_2022_sf <- st_join(gbif_2022_sf, casp_shp_gbif_buffer, join = st_intersects, left = FALSE )
+casp_gbif_2023_sf <- st_join(gbif_2023_sf, casp_shp_gbif_buffer, join = st_intersects, left = FALSE )
+
+## save data
+# saveRDS(casp_gbif_2021_sf, file = "data/processed/gbif_casp_2021.RDS")
+# saveRDS(casp_gbif_2022_sf, file = "data/processed/gbif_casp_2022.RDS")
+# saveRDS(casp_gbif_2023_sf, file = "data/processed/gbif_casp_2023.RDS")
+
+```
+
+Wrangle gbif data for final dataset
+```{r}
+## read in data
+casp_gbif_2021_sf <- readRDS("data/processed/gbif_casp_2021.RDS") 
+casp_gbif_2022_sf <- readRDS("data/processed/gbif_casp_2022.RDS")
+casp_gbif_2023_sf <- readRDS("data/processed/gbif_casp_2023.RDS")
+
+## do grepl now so it doesnt have to recalculate and only select observations with recorded observer
+casp_gbif_2021_sf2 <- casp_gbif_2021_sf %>% 
+    filter(grepl(" SP", UNITNAME) |
+           grepl(" SRA", UNITNAME) |
+           grepl(" SB", UNITNAME) |
+           grepl(" SNR", UNITNAME) |
+           grepl(" SW", UNITNAME)) %>% 
+  filter(grepl("obsr", recordedBy)) %>% # # 818832
+  mutate(date = ymd(eventDate),
+         month = substr(eventDate,6,7),
+         year = substr(eventDate,1,4)) 
+
+
+casp_gbif_2022_sf2 <- casp_gbif_2022_sf %>% 
+    filter(grepl(" SP", UNITNAME) |
+           grepl(" SRA", UNITNAME) |
+           grepl(" SB", UNITNAME) |
+           grepl(" SNR", UNITNAME) |
+           grepl(" SW", UNITNAME)) %>% 
+  filter(grepl("obsr", recordedBy)) %>% 
+  mutate(date = ymd(eventDate),
+         month = substr(eventDate,6,7),
+         year = substr(eventDate,1,4)) 
+
+
+casp_gbif_2023_sf2 <- casp_gbif_2023_sf %>% 
+    filter(grepl(" SP", UNITNAME) |
+           grepl(" SRA", UNITNAME) |
+           grepl(" SB", UNITNAME) |
+           grepl(" SNR", UNITNAME) |
+           grepl(" SW", UNITNAME)) %>% 
+  filter(grepl("obsr", recordedBy)) %>% 
+  mutate(date = ymd(eventDate),
+         month = substr(eventDate,6,7),
+         year = substr(eventDate,1,4))
+
+
+### tally in a more large data friendly way using data.table rather than dplyr
+# make function
+cacl_monthly_avg <- function(dt) {
+  dt <- as.data.table(dt) 
+  
+  dt[, date := as.IDate(date)]
+  dt[, `:=`(year = year(date), month = month(date))]
+  
+  # deduplicate: one user per day per park
+  dt_unique <- unique(dt[, .(UNITNAME, date, recordedBy, year, month)])
+  # Count users per day
+  daily <- dt_unique[, .N, by = .(UNITNAME, year, month, date)] 
+  # Aggregate monthly
+  monthly <- daily[, .(monthly_usertotal = sum(N)), by = .(UNITNAME, year, month)]
+  # Mean per month across years
+  monthly_avg <- monthly[, .(mean_monthly_usertotal = mean(monthly_usertotal)), by = .(UNITNAME, month)]
+  
+  ## now expand grid so all months (1-12) are represented
+  monthly_avg <- monthly_avg %>% 
+    complete(UNITNAME, month = 1:12, fill = list(mean_monthly_usertotal = 0)) %>% 
+    arrange(UNITNAME, month)
+  
+  return(monthly_avg)
+}
+
+# combine datasets
+gbif_dataset <- list(gbif_2021 = casp_gbif_2021_sf2,
+                     gbif_2022 = casp_gbif_2022_sf2,
+                     gbif_2023 = casp_gbif_2023_sf2)
+
+# make empty list to store results
+monthly_avg_results <- list()
+
+# run function
+for(name in names(gbif_dataset)) {
+  # calculate average users
+  monthly_avg_results[[name]] <- cacl_monthly_avg(gbif_dataset[[name]])
+}
+
+
+monthly_avg_all <- rbindlist(monthly_avg_results, idcol = "year_group")
+
+## calculate total unique 
+sum(monthly_avg_all$mean_monthly_usertotal)
+
+## now take year average
+gbif_distinct_20212023_df <- monthly_avg_all %>% 
+  group_by(UNITNAME, month) %>% 
+  summarise(mean_monthly_usertotal = mean(mean_monthly_usertotal), .groups = "drop") %>% # 2580 - so i'm short some parks
+  rename(gbif_monthly_uniquetotals = mean_monthly_usertotal)
+
+write.csv(gbif_distinct_20212023_df, file = "data/processed/gbif_distinct_20212023.csv")
+```
+
+
+##Meta Activity Maps
+(temporary until I get the monthly data)
+
+Step 1. Pull down, filter, and wrangle individual csvs
+```{r}
+## set up params
+chunk_size <- 500000 # number of lines to read in per chunk (helps with memory)
+input_file <- "data/raw/recreation/meta/activitymaps/activity_space_distributions_20250908_us2.csv"
+output_file <- "data/processed/meta_activitymaps_us2.csv"
+
+# filter for california (currently this is all of US)
+# looked at casp_shp_bbox and added + 0.2
+lat_min <- 32.3 
+lat_max <- 42.1
+lon_min <- -125 # western boundary
+lon_max <- -114 # eastern boundary
+
+# choose zoom level (larger zoom values = smaller tiles)
+zoom <- 13 # may fiddle with this (10 is way too coarse for me)
+
+## deleting exisiting output file (helps memory)
+# initial output - makes we we dont append to old runs results
+if(file.exists(output_file)) file.remove(output_file)
+
+## read and filter csv into chunks
+con <- file(input_file, "r") # open connection to large csv
+header <- readLines(con, n = 1) # read first line w/header
+
+## process the csv in chunks (helps memory)
+while(length(chunk_lines <- readLines(con, n = chunk_size)) > 0 ) {
+  
+  # combine header with current chunk lines for data table
+  chunk <- fread(paste(c(header, chunk_lines), collapse = "\n"))
+  
+  # filter chunk for rows that fall within CA boundary
+  chunk[
+    visit_latitude >= lat_min & visit_latitude <= lat_max &
+      visit_longitude >= lon_min & visit_longitude <= lon_max
+  ][
+    , fwrite(.SD, output_file, append = TRUE) # write only filtered data
+  ]
+}
+
+close(con) # close file connection
+
+# load filtered data into memory (vs load in full lg csv)
+ca_data <- fread(output_file) 
+
+## summaries daytime activity
+activity_summary <- ca_data %>% 
+  filter(day_or_night == "daytime") %>% # may switch to night for heat-ag proj
+  group_by(visit_latitude, visit_longitude) %>% # only interested in visit location not home
+  summarise(activity = max(visit_fraction, na.rm = TRUE), .groups = "drop") # could use mean
+
+## compute activity indices for each tile location
+tile_df <- activity_summary %>% 
+  rowwise() %>% # need for lonlat_* since its returned as a list per row
+  mutate(tile = list(lonlat_to_tilenum(visit_longitude, visit_latitude, zoom))) %>% 
+  mutate(xtile = tile$x, ytile = tile$y) %>% # extract x & y index of tile
+  ungroup()
+
+## aggregate activity by tile 
+# remember i'm using max here but could be mean
+tile_activity <- tile_df %>% 
+  group_by(xtile, ytile) %>% 
+  summarise(activity = max(activity), .groups = "drop")
+
+## compute bounding box for each tile
+# for each tile (xtile, ytile) comput its bbox in lat/lon coords
+bbox_df <- tile_activity %>% 
+  rowwise() %>% 
+  mutate(bbox = list(tile_bbox(xtile, ytile, zoom))) %>% 
+  mutate(lng1 = bbox$xmin, lng2 = bbox$xmax, # left/right longitudes
+         lat1 = bbox$ymin, lat2 = bbox$ymax) %>%  # bottom/top latitudes
+  ungroup()
+
+## create tile polygons
+# build each tile polygon using its 4 corners, and close it by repeating the first point
+polygon_list <- purrr::pmap(list(bbox_df$lng1, bbox_df$lng2, bbox_df$lat1, bbox_df$lat2),
+                            function(xmin, xmax, ymin, ymax) {
+                              st_polygon(list(matrix(c(
+                                 xmin, ymin, # bottom left
+                                 xmax, ymin, # bottom eirght
+                                 xmax, ymax, # top right
+                                 xmin, ymax, # top left
+                                 xmin, ymin), # close polygon
+                                 ncol = 2, byrow = TRUE)))
+                            })
+
+## create sf object
+# attach activity values & geometry into a spatial object
+tile_activity_sf <- st_sf(activity = bbox_df$activity,
+                          geometry = st_sfc(polygon_list, crs = 3857)) # check, but i thik tile_bbox gives web mercator coords
+
+# convert 3857 to 4326 for leaflet & downstream analysis
+tile_activity_lonlat <- st_transform(tile_activity_sf, crs = 4326)
+
+#activitymap_us1 <- tile_activity_lonlat # will switch this for the next csv
+ activitymap_us2 <- tile_activity_lonlat
+
+#st_write(activitymap_us1, "data/processed/meta_activitymaps_us1.shp") # i put these into folders _shp
+#st_write(activitymap_us2, "data/processed/meta_activitymaps_us2.shp")
+
+# create color scale
+pal <- colorNumeric("YlOrRd", domain = tile_activity_lonlat$activity, na.color = "transparent")
+
+## create leaflet map
+leaflet(tile_activity_lonlat) %>% 
+  addTiles() %>% 
+  addPolygons(fillColor = ~pal(activity),
+              weight = 1, color = "black", fillOpacity = 0.7,
+              popup = ~paste0("Activity", round(activity, 3))) %>% 
+  addLegend(pal = pal, values = ~activity, title = "Activity Level", position = "bottomright")
+
+
+```
+
+Step 2. Merge the datasets together
+```{r}
+# bind together
+combined_activity <- bind_rows(activitymap_us1, activitymap_us2) # 15477
+
+# check for duplicates
+nrow(combined_activity) - nrow(distinct(combined_activity, geometry)) # 6970
+
+# create distinct observations per pixel
+combined_activity_distinct <- combined_activity %>% # 8507 
+  group_by(geometry) %>% 
+  summarise(activity = max(activity, na.rm = TRUE), .groups = "drop") %>% 
+  st_as_sf()
+
+# check what that coverage looks like
+pal <- colorNumeric("YlOrRd", domain = combined_activity_distinct$activity, na.color = "transparent")
+
+leaflet(combined_activity_distinct) %>%
+  addTiles() %>%
+  addPolygons(fillColor = ~pal(activity),
+              weight = 1, color = "black", fillOpacity = 0.7,
+              popup = ~paste0("Activity: ", round(activity, 3))) %>%
+  addLegend(pal = pal, values = ~activity, title = "Merged Activity", position = "bottomright")
+
+```
+
+Step 3. Add park metadata to merged activity distinct data
+```{r}
+# fix crs of parks
+casp_shp_clean_meta1 <- casp_shp_clean %>% st_make_valid()
+casp_shp_clean_meta <- st_transform(casp_shp_clean_meta1, crs = st_crs(combined_activity_distinct))
+
+# find intersection bwn meta data & park polygons
+activity_casp <- st_intersection(combined_activity_distinct, casp_shp_clean_meta)
+
+activity_casp_summary <- activity_casp %>% 
+  group_by(UNITNAME) %>% 
+  summarise(mean_activity = mean(activity, na.rm = TRUE),
+            max_activity = max(activity, na.rm = TRUE), 
+            sd_activity = sd(activity, na.rm = TRUE), .groups = "drop") %>% 
+  st_drop_geometry()
+
+# merge data with park data
+casp_meta_activity <- casp_shp_clean  %>% 
+  left_join(activity_casp_summary, by = "UNITNAME")
+
+#write.csv(casp_meta_activity , file = "data/processed/meta_activitymaps_distinct.csv")
+
+
+casp_meta_activity_distinct <- casp_meta_activity %>% 
+  distinct(UNITNAME, .keep_all = TRUE) %>% 
+  st_transform(crs = 4326) %>% 
+  rename_with(~ paste0("meta_year_", .x), .cols = c(mean_activity:sd_activity)) %>% 
+  dplyr::select(UNITNAME, meta_year_mean_activity:meta_year_sd_activity) %>% 
+  st_drop_geometry()
+```
+
+
+##CASP yearly visitor totals
+
+```{r}
+casp_visit_raw <- read.csv("data/raw/recreation/casp/Statistical_report_2023_PublicView_-1151597945676077515.csv") %>% clean_names()
+
+# there's multiple years so calculate mean total 
+casp_year_total <- casp_visit_raw %>% 
+  rename(UNITNAME = park_unit) %>% 
+  mutate(UNITNAME = case_when(UNITNAME == "Anza Borrego Desert SP" ~ "Anza-Borrego Desert SP",
+                            UNITNAME == "Bidwell Sacramento River SP" ~ "Bidwell-Sacramento River SP",
+                            UNITNAME == "Bothe Napa Valley SP" ~ "Bothe-Napa Valley SP",
+                            UNITNAME == "Colusa Sacramento River SRA" ~ "Colusa-Sacramento River SRA",
+                            UNITNAME == "McArthur Burney Falls Memorial SP" ~ "McArthur-Burney Falls Memorial SP",
+                            UNITNAME == "Plumas Eureka SP" ~ "Plumas-Eureka SP",
+                            UNITNAME == "Standish Hickey SRA" ~ "Standish-Hickey SRA",
+                            UNITNAME == "Tomo Kahni SHP" ~ "Tomo-Kahni SHP",
+                            UNITNAME == "Trione Annadel SP" ~ "Trione-Annadel SP",
+                            UNITNAME == "Westport Union Landis SB" ~ "Westport-Union Landis SB",
+                            TRUE ~ UNITNAME)) %>% 
+  group_by(UNITNAME) %>% 
+  summarise(casp_year_meantotal = if(n() == 1) total[1] else mean(total, na.rm = TRUE))
+
+
+#write.csv(casp_year_total, file = "data/processed/casp_year_totalvisitors.csv")
+
+```
+
+
+#Extract human LDI at zipcode
+```{r}
+# Zip code level LDI was calculated by Eisen et al 2006b as the mean annual incidence of endemic LD for the period 1993–2005, dropping cases within that date range where the likely county of exposure did not match county of residence, or for which residential zip code information was missing. Eisen et al reported LDI by zip code in the following categories: 0, 0.01–1, 1.01–5, 5.01–10, 10.01–20, 20.01–50, and >50 per 100.000 population
+
+## upload
+ldi <- st_read("data/raw/LD_incidence/CA_Zips_Lyme_NAD83.shp")
+hist(ldi$LDI_Cat) #ldi$ZS_ITS_mea
+
+## correct crs 
+# correct crs
+ldi_crs <- st_transform(ldi, crs = 4326)
+# vectorize ldi
+ldi_vect <- vect(ldi_crs)
+
+# fix crs to ldi crs
+casp_shp_vect_ldi <- casp_shp_clean %>% 
+  st_make_valid() %>% 
+  st_simplify(dTolerance = 0.001, preserveTopology = TRUE) %>% 
+  st_transform(crs = crs(ldi_crs)) %>% 
+  vect()
+
+
+## calculate area-weighted average (if park overlaps multiple ZIP codes, compute LDI for the park as area-weighted average of ZIP-level LDI values intersecting it)
+# give more weight to ZIP codes that cover more area within the park
+# which parks intersect with LDI zipcodes
+intersections <- terra::intersect(casp_shp_vect_ldi, ldi_vect)
+# calculate area of intersected pieces
+intersections$area <- terra::expanse(intersections, unit = "km")
+# compute area-weighted LDI per park
+intersections$LDI_cat <- as.numeric(as.character(intersections$LDI_Cat)) # make sure numeric
+# aggreagate by park
+
+ldi_year_weightedavg <- intersections %>% 
+  as.data.frame() %>% 
+  group_by(UNITNAME) %>% 
+  summarise(area_weighted_ldi = weighted.mean(LDI_Cat, w = area, na.rm = TRUE)) %>% 
+  mutate(area_weighted_ldi = round(area_weighted_ldi,3)) %>% 
+  rename(ldi_year_weightedavg = area_weighted_ldi)
+
+```
+
+
+
+
+
+###Make annual dataframe
+```{r}
+
+casp_shp_clean2 <- casp_shp_clean %>% 
+  left_join(casp_year_total) %>% 
+  distinct(UNITNAME, .keep_all = TRUE)  %>% 
+  #st_drop_geometry() %>% 
+  st_transform(crs = 4326) %>% 
+  # this is annyoing but some name differences are not in a systematic way so had to go 1:1
+  mutate(casp_year_meantotal = case_when(UNITNAME == "Benbow SRA" ~ 163267,
+                                         UNITNAME == "Calaveras Big Trees SP" ~ 143084.5	,
+                                         UNITNAME == "Caswell Memorial SP" ~ 60475	,
+                                         UNITNAME == "China Camp SP" ~ 0,
+                                         UNITNAME == "Colusa-Sacramento River SRA" ~ 1061	,
+                                         UNITNAME == "George J. Hatfield SRA" ~ 7161.5,
+                                         UNITNAME == "Malibu Lagoon SB" ~ 498663	,
+                                         UNITNAME == "McConnell SRA" ~ 34909	,
+                                         UNITNAME == "Millerton Lake SRA" ~ 422527.2	,
+                                         UNITNAME == "Monterey SB" ~ 418737.5	,
+                                         UNITNAME == "Mount Tamalpais SP" ~ 305614.5	,
+                                         UNITNAME == "Point Dume SB" ~ 854099.5	,
+                                         UNITNAME == "Point Mugu SP" ~ 975356.5	,
+                                         UNITNAME == "Point Sal SB" ~ 2986.5	,
+                                         UNITNAME == "Samuel P. Taylor SP" ~ 117227.5	,
+                                         UNITNAME == "Santa Monica SB" ~ 5337349	,
+                                         UNITNAME == "Standish-Hickey SRA" ~ 31025	,
+                                         UNITNAME == "Topanga SP" ~ 695937	,
+                                         UNITNAME == "Turlock Lake SRA" ~ 0,
+                                         UNITNAME == "Will Rogers SB" ~ 1444256	,
+                                         UNITNAME == "Refugio SB" ~ 188797.5	,
+                                         UNITNAME == "Rio de Los Angeles State Park SRA" ~ 496492.5	,
+                                         UNITNAME == "Henry W. Coe SW" ~ 24809	,
+                                         UNITNAME == "Admiral William Standley SRA" ~ 23360	,
+                                         UNITNAME == "Tomales Bay SP" ~ 55060.5	,
+                                         UNITNAME == "McLaughlin Eastshore SP (SS)" ~ 0,
+                                         UNITNAME == "Providence Mountains SRA " ~ 2423.5	,
+                                         UNITNAME == "Clear Lake SP" ~ 112114.5	,
+                                         UNITNAME == "San Luis Reservoir SRA" ~ 158294	,
+                                         UNITNAME == "Sinkyone SW" ~ 17449	,
+                                         UNITNAME == "Great Valley Grasslands SP" ~ 0,
+                                         UNITNAME == "Limekiln SW" ~ 19223.5	, 
+                                         UNITNAME == "El Capitán SB" ~ 189942.5	, 
+                                         UNITNAME == "California Indian Heritage Center SP" ~ 0, 
+                                         UNITNAME == "San Luis Reservoir SRA - O'Neil Forebay Wildlife Area" ~ 158294	,
+                                         UNITNAME == "Folsom Lake SRA - Nimbus Fish Hatchery" ~ 725094.2	, 
+                                         UNITNAME == "Mount San Jacinto SW" ~ 2156274	, 
+                                         UNITNAME == "Mount Diablo SP - Diablo Foothills Regional Park" ~ 358846.5	,
+                                         UNITNAME == "Cuyamaca Mountain SW" ~ 458391	, 
+                                         UNITNAME == "Silver Strand SB - Area leased to Navy" ~ 596349.0	, 
+                                         UNITNAME == "Anza-Borrego Desert SW" ~ 158180.5	,
+                                         
+                                         TRUE ~ casp_year_meantotal)) 
+
+# in casp_shp_clean but not casp_year_total casp_year_total %>% filter(grepl("Anza", UNITNAME))
+# Sue-meg SP, Westport-Union Landing SB, West Waddell Creek SW, Murrelet SW, Redwood Heritage SW, Henry W. Coe SP - Sillaci Conservation Easement (check), Bull Creek SW
+# San Luis Reservoir SRA - Dam Operations Area, Palomar Mountain SP School Camp,  Santa Rosa Mountains SW, Mount San Jacinto SW, Mount Diablo SP - Morgan Territory Regional Preserve, Mount Diablo SP - Diablo Foothills Regional Park, Cuyamaca Mountain SW, Boney Mountain SW, Silver Strand SB - Area leased to Navy, Manhattan SB, Anza-Borrego Desert SW, 
+```
+
+Save annual data as geopackage
+```{r}
+
+casp_fulldata_annual <- casp_shp_clean2 %>% 
+  left_join(casp_tick_suit_distinct, by = "UNITNAME") %>% 
+  left_join(casp_tick_inf_distinct, by = "UNITNAME") %>% 
+  left_join(ldi_year_weightedavg, by = "UNITNAME") %>% 
+  dplyr::select(c(UNITNAME:district, tick_year_presence:ldi_year_weightedavg, casp_year_meantotal)) %>% 
+  left_join(casp_meta_activity_distinct, by = "UNITNAME") %>% 
+  rename(shape_area = Shape_Area)
+
+st_write(casp_fulldata_annual, "data/processed/casp_fulldata_annual.gpkg", delete_dsn = TRUE)
+# use st_read to open
+
+```
+
+###Make monthly dataframe
+
+```{r}
+# make tick presence from wide to long
+casp_slimdata_monthly_nometa <- casp_shp_clean2 %>% 
+  right_join(casp_tick_monthly_suit_distinct, by = "UNITNAME") %>% 
+  dplyr::select(-casp_year_meantotal) %>% 
+  left_join(flickr_distinct_20212024_df, by = c("UNITNAME", "month")) %>% 
+  left_join(gbif_distinct_20212023_df, by =  c("UNITNAME", "month"))
+
+st_write(casp_slimdata_monthly_nometa, "data/processed/casp_slimdata_monthly_nometa.gpkg", delete_dsn = TRUE)
+```
+
+
+##Calculate proportions
+
+```{r}
+## first calc for each source
+flickr_prop <- casp_fulldata_monthly_nometa %>% 
+  st_drop_geometry() %>% 
+  group_by(UNITNAME, month) %>% 
+  summarise(flickr_avg_total = sum(flickr_monthly_uniquetotals), .groups = "drop") %>% 
+  group_by(UNITNAME) %>% 
+  mutate(flickr_monthly_prop = flickr_avg_total/sum(flickr_avg_total)) %>% 
+  ungroup() %>% 
+  rename(flickr_monthly_avgtotal = flickr_avg_total)
+
+
+gbif_prop <- casp_fulldata_monthly_nometa %>% 
+  st_drop_geometry() %>% 
+  group_by(UNITNAME, month) %>% 
+  summarise(gbif_avg_total = sum(gbif_monthly_uniquetotals, na.rm = TRUE), .groups = "drop") %>% 
+  group_by(UNITNAME) %>% 
+  mutate(total_sum = sum(gbif_avg_total, na.rm = TRUE), 
+    gbif_monthly_prop = ifelse(total_sum == 0, 0, gbif_avg_total/total_sum)) %>% 
+  ungroup() %>% 
+  rename(gbif_monthly_avgtotal = gbif_avg_total) %>% 
+  dplyr::select(-total_sum)
+
+ gbif_prop %>%  filter(grepl("D.L. Bliss", UNITNAME)) %>% 
+  ggplot(aes( x = as.integer(month), y = gbif_monthly_prop)) +
+  geom_point() +
+  geom_line() +
+  theme_light()
+ 
+ ## relate to CASP yearly totals
+ 
+flickr_prop_estimatedvisits <- casp_fulldata_annual %>% 
+   st_drop_geometry() %>% 
+   dplyr::select(UNITNAME,casp_year_meantotal) %>% 
+   tidyr::crossing(month = 1:12) %>% 
+   left_join(flickr_prop, by = c("UNITNAME", "month")) %>% 
+   mutate(flickr_monthly_estimatedvisits = casp_year_meantotal*flickr_monthly_prop,
+          flickr_monthly_estimatedvisits = ifelse(is.na(flickr_monthly_estimatedvisits), 0, flickr_monthly_estimatedvisits)) 
+ 
+ gbif_prop_estimatedvisits <- casp_fulldata_annual %>% 
+   st_drop_geometry() %>% 
+   dplyr::select(UNITNAME,casp_year_meantotal) %>% 
+   tidyr::crossing(month = 1:12) %>% 
+   left_join(gbif_prop, by = c("UNITNAME", "month")) %>% 
+   mutate(gbif_monthly_estimatedvisits = casp_year_meantotal*gbif_monthly_prop,
+          gbif_monthly_estimatedvisits = ifelse(is.na(gbif_monthly_estimatedvisits), 0, gbif_monthly_estimatedvisits)) 
+ 
+ 
+ ## make one dataframe with visits
+flickrgbif_estimatedvisits <- flickr_prop_estimatedvisits %>%
+  left_join(gbif_prop_estimatedvisits, by = c("UNITNAME", "month"))
+
+
+
+
+flickrgbif_monthlyprop <- flickrgbif_estimatedvisits %>%
+  dplyr::select(UNITNAME, month, flickr_monthly_prop, gbif_monthly_prop) %>% 
+  mutate(flickrgbif_monthly_prop = rowMeans(cbind(flickr_monthly_prop, gbif_monthly_prop), na.rm = TRUE)) %>% 
+  dplyr::select(UNITNAME, month, flickrgbif_monthly_prop)
+
+
+## need to figure out when casp_year_meantotal is 0 but flickr/gbif recorded someone
+flickrgbif_avg_estimatedvisits <- casp_fulldata_annual %>% 
+   st_drop_geometry() %>% 
+   dplyr::select(UNITNAME,casp_year_meantotal) %>% 
+   tidyr::crossing(month = 1:12) %>% 
+  left_join(flickrgbif_monthlyprop, by = c("UNITNAME", "month")) %>% 
+  mutate(flickrgbif_estimatedvisits = casp_year_meantotal*flickrgbif_monthly_prop,
+         flickrgbif_estimatedvisits = ifelse(is.na(flickrgbif_estimatedvisits), 0, flickrgbif_estimatedvisits)) %>% 
+  dplyr::select(UNITNAME, month, flickrgbif_estimatedvisits, casp_year_meantotal, flickrgbif_monthly_prop)
+
+flickrgbif_estimatedvisits2 <- flickrgbif_estimatedvisits %>% 
+  left_join(flickrgbif_avg_estimatedvisits %>% dplyr::select(UNITNAME, month, flickrgbif_estimatedvisits), by = c("UNITNAME", "month")) %>% 
+  rename(casp_year_meantotal = casp_year_meantotal.x) %>% 
+  dplyr::select(UNITNAME, month, flickrgbif_estimatedvisits, flickr_monthly_avgtotal:gbif_monthly_estimatedvisits)
+
+#write.csv(flickrgbif_estimatedvisits2, file = "data/processed/flickrgbif_estimatedvisits.csv")
+```
+
+Make final monthly dataset with both tick and human 
+
+```{r}
+casp_fulldata_monthly_nometa <- casp_slimdata_monthly_nometa %>% #casp_fulldata_monthly_nometa %>% 
+  left_join(flickrgbif_estimatedvisits2, by = c("UNITNAME", "month")) %>% 
+  rename(casp_year_meantotal = casp_year_meantotal.y) %>% 
+  dplyr::select(UNITNAME, field_divi, district, month, tick_monthly_presence,flickrgbif_estimatedvisits,
+                flickr_monthly_uniquetotals:gbif_monthly_estimatedvisits) %>% 
+  mutate(hotspot_index = tick_monthly_presence*flickrgbif_estimatedvisits) 
+
+st_write(casp_fulldata_monthly_nometa, "data/processed/casp_fulldata_monthly_nometa.gpkg", delete_dsn = TRUE)
+```
+
+##make zipcode dataframe
+```{r}
+ldi <- st_read("data/raw/LD_incidence/CA_Zips_Lyme_NAD83.shp") 
+
+ca_zipcode_shp <- ldi %>% 
+  st_transform(st_crs(ca_shp)) %>% 
+  dplyr::select(ZIP_CODE,PO_NAME, geometry, LDI_Cat)
+  #dplyr::select(ZIP_CODE, PO_NAME, LDI_Cat,  GEOID, NAME)
+
+## extract infected tick at zipcode
+
+
+# fix crs
+ca_zipcode_vect <- ca_zipcode_shp %>% vect()
+
+# extract predictions per park
+zipcode_tick_inf_means <- terra::extract(tick_year_inf, ca_zipcode_vect, fun = mean, na.rm = TRUE)
+
+# make into dataframe
+zipcode_tick_df <- bind_cols(as.data.frame(ca_zipcode_vect), zipcode_tick_inf_means)
+names(zipcode_tick_df)[4] <- "tick_year_inf_prob"
+
+#write.csv(zipcode_tick_df , file = "data/processed/zipcode_tickinf.csv")
+
+zipcode_tick_shp <- ca_zipcode_shp %>% 
+  left_join(zipcode_tick_df, by = "ZIP_CODE")
+  
+ggplot() +
+  geom_sf(data = zipcode_tick_shp, aes(fill = tick_year_inf_prob), color = NA, size = 0.1) +
+  scale_fill_viridis_c(option = "H", direction = 1, na.value = "grey90", name = "Infected Tick Probability") + 
+  theme_void() +
+    theme(plot.title = element_text(face = "bold", size = 14), #hjust = 0.5,
+        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+        legend.position = "right",
+        legend.direction = "vertical", 
+        legend.key.width = unit(.5, "cm"), 
+        legend.title = element_text(vjust = .7))
+
+
+```
+
+##extract meta activity map to zipcode
+```{r}
+ca_zipcode_shp2 <- ca_zipcode_shp %>% st_make_valid()
+
+## reformat meta data
+activitymap_us1 <- st_read("data/processed/meta_activitymaps_us1_shp/meta_activitymaps_us1.shp")
+activitymap_us2 <- st_read("data/processed/meta_activitymaps_us2_shp/meta_activitymaps_us2.shp")
+
+# bind together
+combined_activity <- bind_rows(activitymap_us1, activitymap_us2) # 15477
+combined_activity_sf <- combined_activity %>% st_transform(st_crs(ca_zipcode_shp)) %>% st_make_valid()
+
+## tried this method
+# Check CRS
+activity_vect <- project(vect(combined_activity_sf), "EPSG:3310")  # use projected CRS
+
+# Ensure activity is numeric
+activity_vect$activity <- as.numeric(activity_vect$activity)
+
+# Make raster template
+r_template <- rast(extent = ext(activity_vect), resolution = 1700,crs = crs(activity_vect))
+
+# Rasterize with buffer to ensure coverage
+activity_vect_buff <- buffer(activity_vect, width = 850)
+
+r <- rasterize(activity_vect_buff, r_template, field = "activity", fun = mean)
+
+# Plot to confirm
+plot(r)
+
+
+zip_vect <- project(vect(ca_zipcode_shp), crs(r))
+zipcode_activity_df <- terra::extract(r, zip_vect, fun = mean, na.rm = TRUE)
+
+zip_vect$mean_activity <- zipcode_activity_df[, 2] 
+
+zip_sf <- st_as_sf(zip_vect) %>% st_transform(st_crs(ca_shp))
+
+#st_write(zip_sf, "data/processed/meta_activitymaps_zipcode_v1.shp") # made into a folder
+
+
+
+
+ggplot() +
+  geom_sf(data = zip_sf, aes(fill = mean_activity), color = NA, size = 0.1) +
+  scale_fill_viridis_c(option = "H", direction = 1, na.value = "grey90", name = "Meta Activity") + 
+  theme_void() +
+    theme(plot.title = element_text(face = "bold", size = 14), #hjust = 0.5,
+        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+        legend.position = "right",
+        legend.direction = "vertical", 
+        legend.key.width = unit(.5, "cm"), 
+        legend.title = element_text(vjust = .7))
+```
+
+
+Make zipcode dataframe
+```{r}
+
+zipcode_fulldata_annual <- zip_sf %>% 
+  left_join(ca_zipcode_shp %>% dplyr::select(ZIP_CODE, LDI_Cat) %>% st_drop_geometry(), by = "ZIP_CODE") %>% 
+  left_join(zipcode_tick_shp %>% dplyr::select(ZIP_CODE, tick_year_inf_prob) %>% st_drop_geometry(), by = "ZIP_CODE") %>% 
+  rename(meta_activity = mean_activity,
+         tickinf_prob = tick_year_inf_prob) %>% 
+  clean_names() 
+
+#write.csv(zipcode_fulldata_annual, "data/processed/zipcode_fulldata_annual.csv")
+st_write(zipcode_fulldata_annual, "data/processed/zipcode_fulldata_annual.gpkg")
+
+```
+
+
+
+
+##new 2020-10-07
+
+make population weighted activity level
+```{r}
+## upload population density
+gpw <- rast("data/raw/gpw-v4-population-density-rev11_2020_30_sec_asc/gpw_v4_population_density_rev11_2020_30_sec_1.asc")
+
+# transform to ca crs
+ca_shp_gpw <- ca_shp %>% 
+  st_transform(crs(gpw)) %>% 
+  vect() %>% 
+  {mask(crop(gpw, .), .)} 
+
+## facebok data - this is already formatted to daytime max activity
+## reformat meta data
+activitymap_us1 <- st_read("data/processed/meta_activitymaps_us1_shp/meta_activitymaps_us1.shp")
+activitymap_us2 <- st_read("data/processed/meta_activitymaps_us2_shp/meta_activitymaps_us2.shp")
+
+# bind together
+combined_activity <- bind_rows(activitymap_us1, activitymap_us2) # 15477
+
+combined_activity_sf <- combined_activity %>% st_transform(st_crs(ca_shp_gpw)) %>% st_make_valid()
+
+## rasterize the activity 
+activity_raster <- rasterize(vect(combined_activity_sf), ca_shp_gpw, field = "activity", fun = "mean") # bc meta data are normalized b/w 
+
+# now resample to match 
+pop_resampled <- resample(ca_shp_gpw, activity_raster , method = "bilinear") # for continuous data
+
+
+## multiply to get population weighted activity
+pop_weighted_activity <- pop_resampled*activity_raster
+
+library(raster)
+pop_raster <- raster(pop_weighted_activity)
+
+# Optional: define color palette
+pal <- colorNumeric(palette = "plasma", domain = values(pop_raster), na.color = "transparent")
+
+pal <- colorNumeric(palette = rev(viridis::viridis(256, option = "plasma")),
+                    domain = values(pop_raster),
+                    na.color = "transparent")
+# Create leaflet map
+leaflet() %>%
+  addRasterImage(pop_raster, colors = pal, opacity = 0.8) %>%
+  addLegend(pal = pal, values = values(pop_raster),
+            title = "Pop-Weighted<br>Visitation") %>%
+  setView(lng = -120, lat = 37, zoom = 6)
+
+## then take the sum per park extract(pop_weighted_activity, parks, fun = sum, na.rm = TRUE)
+# This should return TRUE
+#st_crs(casp_vect) == crs(pop_weighted_activity)
+st_crs(casp_shp_reprojected)
+crs(pop_weighted_activity) 
+```
