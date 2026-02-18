@@ -1,0 +1,354 @@
+---
+title: "DataCleaning_MetaPipeline_20260113"
+output: html_document
+date: "2026-01-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(data.table)
+library(dplyr)
+library(sf)
+library(terra)
+library(purrr)
+library(stringr)
+library(lubridate)
+
+
+### step 1. set paths
+zip_paths <- c("data/raw/recreation/meta/acitivitymaps_full/2024 USA Activity Space Maps.zip")
+              #"data/raw/recreation/meta/acitivitymaps_full/2025 USA Activity Space Maps.zip"
+
+
+gpw_path <- "data/raw/humanpop_count/gpw_v4_population_count_rev11_2015_2pt5_min.tif"
+
+## set params
+
+# ca bounding box
+lat_min <- 32.3
+lat_max <- 42.1
+lon_min <- -125
+lon_max <- -114
+
+
+# tile zoom level
+zoom <- 13
+
+
+## step 2. read gpw pop raster
+gpw <- rast(gpw_path)
+
+```
+
+for multiple zips (try this)
+```{r}
+
+
+### Step 2: Function to process a single CSV from a ZIP
+process_meta_csv <- function(zip_path, csv_file) {
+  message("Processing: ", csv_file, " from ", basename(zip_path))
+  
+  # Correct: use zip_path, not zip_paths
+  dt <- fread(unzip(zip_path, files = csv_file))
+  
+  # filter for CA & daytime
+  dt <- dt %>% 
+    filter(
+      visit_latitude >= lat_min & visit_latitude <= lat_max,
+      visit_longitude >= lon_min & visit_longitude <= lon_max,
+      day_or_night == "daytime"
+    )
+  
+  # round home coordinates to match GPW raster
+  dt <- dt %>% 
+    mutate(
+      home_lat_round = round(home_latitude, 5),
+      home_lon_round = round(home_longitude, 5)
+    )
+  
+  # convert home coordinates to sf
+  home_sf <- dt %>% 
+    distinct(home_lat_round, home_lon_round) %>% 
+    st_as_sf(coords = c("home_lon_round", "home_lat_round"), crs = 4326)
+  
+  # project to GPW raster crs
+  home_sf_proj <- st_transform(home_sf, crs(gpw)) %>% 
+    mutate(
+      home_lon_round = st_coordinates(.)[,1],
+      home_lat_round = st_coordinates(.)[,2]
+    )
+  
+  # extract population counts
+  home_sf_proj$home_population <- terra::extract(gpw, vect(home_sf_proj))[,2]
+  
+  # join pop counts back to main data
+  dt <- dt %>% 
+    left_join(
+      home_sf_proj %>% st_drop_geometry(),
+      by = c("home_lat_round", "home_lon_round")
+    ) %>% 
+    mutate(
+      home_population = ifelse(is.na(home_population), 0, home_population),
+      weighted_activity = home_population * visit_fraction
+    )
+  
+  return(dt)
+}
+
+### Step 3: Function to process all CSVs in a single ZIP
+process_zip <- function(zip_path) {
+  if(!file.exists(zip_path)) stop("ZIP file not found: ", zip_path)
+  
+  zip_contents <- unzip(zip_path, list = TRUE)
+  
+  # robustly get the file name column
+  name_col <- grep("name", names(zip_contents), ignore.case = TRUE, value = TRUE)
+  
+  if(length(name_col) == 0) stop("No column containing file names found in ZIP: ", zip_path)
+  
+  files <- zip_contents[[name_col]]
+  
+  # exclude hidden files and only keep CSVs
+  files_to_process <- files[!grepl("__MACOSX", files) & grepl("\\.csv$", files, ignore.case = TRUE)]
+  
+  if(length(files_to_process) == 0) {
+    warning("No CSV files found in ZIP: ", zip_path)
+    return(NULL)
+  }
+  
+  # process each CSV and combine results
+  zip_data <- map_dfr(files_to_process, ~process_meta_csv(zip_path, .x))
+  
+  # add year column extracted from ZIP file name
+  zip_data <- zip_data %>% mutate(year = str_extract(basename(zip_path), "\\d{4}"))
+  
+  return(zip_data)
+}
+
+### Step 4: Process all ZIP files
+all_activity_data <- map_dfr(zip_paths, process_zip)
+
+### Step 5: Inspect
+glimpse(all_activity_data)
+
+
+```
+step 6/7
+```{r}
+library(dplyr)
+library(sf)
+
+# --- Step 6: Aggregate activity per visit tile ---
+
+activity_summary <- all_activity_data %>%
+  mutate(
+    visit_lat_round = round(visit_latitude, 5),
+    visit_lon_round = round(visit_longitude, 5)
+  ) %>%
+  group_by(visit_lat_round, visit_lon_round) %>%
+  summarise(
+    total_weighted_activity = sum(weighted_activity, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- Step 7: Fully vectorized tile calculation ---
+
+# Tile numbers
+n <- 2^zoom
+xtile <- floor((activity_summary$visit_lon_round + 180) / 360 * n)
+ytile <- floor((1 - log(tan(activity_summary$visit_lat_round * pi / 180) + 
+                        1 / cos(activity_summary$visit_lat_round * pi / 180)) / pi) / 2 * n)
+
+# Aggregate activity by tile
+tile_activity <- activity_summary %>%
+  mutate(xtile = xtile, ytile = ytile) %>%
+  group_by(xtile, ytile) %>%
+  summarise(activity = sum(total_weighted_activity, na.rm = TRUE), .groups = "drop")
+
+# --- Vectorized tile bounding boxes ---
+# Compute lon/lat for xmin, xmax, ymin, ymax
+n_tiles <- 2^zoom
+
+xmin <- tile_activity$xtile / n_tiles * 360 - 180
+xmax <- (tile_activity$xtile + 1) / n_tiles * 360 - 180
+
+lat_rad <- function(y) atan(sinh(pi * (1 - 2 * y / n_tiles)))
+lat_deg <- function(y) lat_rad(y) * 180 / pi
+
+ymax <- lat_deg(tile_activity$ytile)
+ymin <- lat_deg(tile_activity$ytile + 1)
+
+# --- Build polygons vectorized ---
+coords_matrix <- cbind(
+  rep(1:nrow(tile_activity), each = 5), # tile index repeated 5 times per polygon
+  rbind(
+    cbind(xmin, ymin),
+    cbind(xmax, ymin),
+    cbind(xmax, ymax),
+    cbind(xmin, ymax),
+    cbind(xmin, ymin)
+  )
+)
+
+# Split by tile to create polygons
+split_coords <- split(coords_matrix[, -1], coords_matrix[, 1])
+polygon_list <- Map(
+  function(xmin, xmax, ymin, ymax) {
+    st_polygon(list(matrix(
+      c(
+        xmin, ymin,
+        xmax, ymin,
+        xmax, ymax,
+        xmin, ymax,
+        xmin, ymin  # close the polygon
+      ),
+      ncol = 2,
+      byrow = TRUE
+    )))
+  },
+  xmin, xmax, ymin, ymax
+)
+
+# --- Create SF object ---
+ca_grid_sf <- st_sf(
+  activity = tile_activity$activity,
+  geometry = st_sfc(polygon_list, crs = 4326)
+)
+
+# Save shapefile
+st_write(ca_grid_sf, "data/processed/ca_activity_grid_2024.shp", delete_layer = TRUE)
+
+
+library(tmap)
+
+# Simple interactive map
+tm_shape(ca_grid_sf) +
+  tm_polygons(
+    "activity", 
+    palette = "YlOrRd", 
+    title = "Weighted Activity",
+    style = "cont",         # continuous values
+    transform = function(x) log10(x + 1)  # log10 transform, +1 avoids log(0)
+  )
+```
+
+save monthly values
+```{r}
+library(dplyr)
+library(lubridate)
+library(sf)
+library(tmap)
+
+# -------------------------------
+# STEP 6: Monthly activity summary
+# -------------------------------
+
+activity_summary_month <- all_activity_data %>%
+  mutate(month = substr(ds, 6,7),
+    visit_lat_round = round(visit_latitude, 5),
+    visit_lon_round = round(visit_longitude, 5)
+  ) %>%
+  group_by(visit_lat_round, visit_lon_round, month) %>%
+  summarise(
+    total_weighted_activity = sum(weighted_activity, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# -------------------------------
+# STEP 7: Tile calculation (vectorized)
+# -------------------------------
+
+n <- 2^zoom
+
+xtile <- floor((activity_summary_month$visit_lon_round + 180) / 360 * n)
+ytile <- floor(
+  (1 - log(
+    tan(activity_summary_month$visit_lat_round * pi / 180) +
+      1 / cos(activity_summary_month$visit_lat_round * pi / 180)
+  ) / pi) / 2 * n
+)
+
+tile_activity_month <- activity_summary_month %>%
+  mutate(xtile = xtile, ytile = ytile) %>%
+  group_by(xtile, ytile, month) %>%
+  summarise(
+    activity = sum(total_weighted_activity, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# -------------------------------
+# STEP 8: Tile bounding boxes (vectorized)
+# -------------------------------
+
+n_tiles <- 2^zoom
+
+xmin <- tile_activity_month$xtile / n_tiles * 360 - 180
+xmax <- (tile_activity_month$xtile + 1) / n_tiles * 360 - 180
+
+lat_deg <- function(y) atan(sinh(pi * (1 - 2 * y / n_tiles))) * 180 / pi
+
+ymax <- lat_deg(tile_activity_month$ytile)
+ymin <- lat_deg(tile_activity_month$ytile + 1)
+
+# -------------------------------
+# STEP 9: Build tile polygons (SAFE)
+# -------------------------------
+
+polygon_list <- Map(
+  function(xmin, xmax, ymin, ymax) {
+    st_polygon(list(matrix(
+      c(
+        xmin, ymin,
+        xmax, ymin,
+        xmax, ymax,
+        xmin, ymax,
+        xmin, ymin
+      ),
+      ncol = 2,
+      byrow = TRUE
+    )))
+  },
+  xmin, xmax, ymin, ymax
+)
+
+# -------------------------------
+# STEP 10: Create SF object
+# -------------------------------
+
+ca_grid_sf_month <- st_sf(
+  tile_activity_month,
+  geometry = st_sfc(polygon_list, crs = 4326)
+)
+
+# -------------------------------
+# STEP 11: Save
+# -------------------------------
+
+st_write(
+  ca_grid_sf_month,
+  "data/processed/ca_activity_grid_2024_month.shp",
+  delete_layer = TRUE
+)
+
+# -------------------------------
+# STEP 12: Visualize (monthly facets)
+# -------------------------------
+
+tmap_mode("view")
+
+dec_sf <- ca_grid_sf_month %>%
+  filter(month == "07")
+
+tm_shape(dec_sf) +
+  tm_polygons(
+    "activity",
+    palette = "YlOrRd",
+    title = "Weighted Activity",
+    style = "cont",
+    transform = function(x) log10(x + 1)
+  ) 
+
+```
+
+

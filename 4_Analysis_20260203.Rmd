@@ -1,0 +1,897 @@
+---
+title: "4_Analysis_20260203"
+output: html_document
+date: "2026-02-03"
+---
+
+(something is wrong with underlying data)
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(spdep)
+library(spatialreg)
+library(INLA)
+library(stringr)
+
+```
+
+(old)
+```{r}
+data <- read.csv("data/processed/data_clean_analysis_monthly_long.csv") %>% 
+  rename(zip_code = ZIP_CODE) %>% 
+  mutate(zip_code = as.character(zip_code)) %>% 
+  mutate(zip_code = str_pad(as.character(zip_code), 5, "left", "0"))
+
+ca_total_pop <- read.delim("data/raw/cademographics_totalpop.csv") %>% 
+  mutate(zip_code = str_pad(as.character(zip_code), 5, "left", "0"))
+  
+zipcode_shp <- st_read("data/processed/zipcode_fulldata_annual.gpkg") %>%  # 1721
+  st_make_valid() %>% 
+  mutate(zip_code = str_pad(as.character(zip_code), 5, "left", "0")) #something is wrong there's not all zipcodes
+
+all_zips <- unique(c(data$zip_code, ca_total_pop$zip_code, zipcode_shp$zip_code))
+
+zipcode_shp <- zipcode_shp %>% 
+  right_join(tibble(zip_code = all_zips), by = "zip_code") %>% filter(!st_is_empty(geom) & !is.na(geom)) %>% 
+  rename(geometry = geom)
+
+
+
+```
+
+
+updated data (this is for ZIP)
+```{r}
+zipcode_shp <- st_read("data/processed/zipcode_fulldata_annual.gpkg") %>%  # 1721
+  st_make_valid() %>% 
+  mutate(zip_code = str_pad(as.character(zip_code), 5, "left", "0")) %>%
+  arrange(zip_code) %>% 
+  rename(geometry = geom) %>%
+  mutate(zip_id = row_number())
+
+ca_total_pop <- read.delim("data/raw/cademographics_totalpop.csv") %>% 
+  mutate(zip_code = str_pad(as.character(zip_code), 5, "left", "0"))
+
+
+### look at this data instead
+zip_activity <- read.csv("data/processed/meta_annual_zip.csv") %>% dplyr::select(-X) %>% 
+  rename(zip_code = ZIP_CODE) %>% 
+  mutate(zip_code = as.character(zip_code)) %>% 
+  mutate(zip_code = str_pad(as.character(zip_code), 5, "left", "0")) %>% #1721
+  mutate(zip_id = as.numeric(factor(zip_code)))
+
+
+zip_tick_inf_distinct <- read.csv("data/processed/zip_tick_inf_distinct.csv") %>% 
+  mutate(zip_code = as.character(zip_code)) %>% 
+  mutate(zip_code = str_pad(as.character(zip_code), 5, "left", "0"))
+
+
+zip_data <- zip_activity %>% 
+  left_join(ca_total_pop, by = "zip_code") %>% 
+  mutate(total_pop = replace_na(total_pop, 0)) %>% 
+  rename(total_activity_meta_zip = total_activity) %>% 
+  left_join(zip_tick_inf_distinct, by = "zip_code") %>% 
+  rename(tick_year_inf_zip = tick_year_inf) %>% 
+  left_join(zipcode_shp %>% dplyr::select(zip_code, ldi_cat, geometry), by = "zip_code") %>% 
+  dplyr::select(zip_code, zip_id, po_name, total_pop, ldi_cat, total_activity_meta_zip, tick_year_inf_zip, geometry) %>% 
+  mutate(# log transform
+    across(c(total_pop, total_activity_meta_zip), ~ log(.x+1), .names = "{.col}_log"),
+         # center
+         tick_inf_zip_c = tick_year_inf_zip - mean(tick_year_inf_zip, na.rm = TRUE),
+         activity_zip_c = total_activity_meta_zip_log - mean(total_activity_meta_zip_log, na.rm = TRUE)) %>%
+  mutate(zip_code = as.character(zip_code)) %>%
+  arrange(zip_code) %>%
+  mutate(zip_id = row_number())
+
+zip_data_shp <- zip_data %>% st_as_sf()
+
+
+
+
+## create spatial adjacey graph
+
+nb <- poly2nb(as_Spatial(zipcode_shp), queen = TRUE, row.names = zipcode_shp$zip_id)
+#summary(nb)
+
+nb2INLA("zip_adj.graph", nb)
+g <- inla.read.graph("zip_adj.graph")
+
+
+formula <- ldi_cat ~ tick_inf_zip_c + activity_zip_c + (tick_inf_zip_c*activity_zip_c) +
+  f(zip_id, model = "bym2", graph = g, scale.model = TRUE,
+    hyper = list(prec = list(prior = "pc.prec", param = c(1, 0.01)),
+      phi  = list(prior = "pc", param = c(0.5, 2/3))
+    ))
+
+result <- inla(
+  formula,
+  family =" poisson",
+  data = zip_data,
+  offset = total_pop_log, 
+  control.predictor = list(compute = TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE)
+)
+
+
+result_nb <- inla(
+  formula,
+  family ="nbinomial",
+  data = zip_data,
+  offset = total_pop_log, 
+  control.predictor = list(compute = TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE)
+)
+
+```
+
+
+
+inspect results
+```{r}
+
+# fixed effects (main and interacio)
+result_poisson <- as.data.frame(result$summary.fixed)
+
+as.data.frame(result_nb$summary.fixed)
+# spatial hyperparams
+result$summary.hyperpar
+
+spatial_effects <- result_nb$summary.random$zip_id
+
+zip_shp$spatial_mean <- spatial_effects$mean[
+  match(zip_shp$zip_id, spatial_effects$ID)
+]
+
+```
+
+visualize
+```{r}
+res <- result_nb
+library(ggplot2)
+
+fixed_df <- as.data.frame(res$summary.fixed)
+fixed_df$covariate <- rownames(fixed_df)
+
+fixed_df %>% 
+  filter(covariate != "(Intercept)") %>% 
+ggplot(aes(x=covariate, y=mean)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=`0.025quant`, ymax=`0.975quant`), width=0.2) +
+  coord_flip() +
+  geom_hline(yintercept = 0) +
+  theme_minimal() +
+  labs(title="Posterior estimates of fixed effects", y="Posterior mean", x="") 
+
+
+```
+```{r}
+result$waic$waic   #5336.3     # Poisson
+result_nb$waic$waic #5266.365
+
+result_nb$summary.hyperpar
+
+# Source - https://stackoverflow.com/a/77512186
+# Posted by margusl
+# Retrieved 2026-02-05, License - CC BY-SA 4.0
+
+
+```
+
+(now try with non-ZIP average)
+```{r}
+data_clean_analysis_monthly  <- read.csv("data/processed/data_clean_analysis_monthly.csv")
+
+casp_activity <- data_clean_analysis_monthly %>% 
+  dplyr::select(UNITNAME, ZIP_CODE, activity_annualtotal_incasp) %>% 
+  group_by(ZIP_CODE) %>% 
+  summarise(activity_annualtotal_incasp = mean(activity_annualtotal_incasp, na.rm = TRUE), .groups = "drop") %>% 
+  rename(zip_code = ZIP_CODE) %>% 
+  mutate(zip_code = as.character(zip_code)) %>% 
+  mutate(zip_code = str_pad(as.character(zip_code), 5, "left", "0"))
+
+
+zip_data2 <- zip_data %>% 
+  left_join(casp_activity, by = "zip_code") %>% 
+  mutate(activity_annualtotal_incasp = tidyr::replace_na(activity_annualtotal_incasp, 0),
+         activity_annualtotal_incasp_log = log(activity_annualtotal_incasp+1),
+         activity_casp_c = activity_annualtotal_incasp_log - mean(activity_annualtotal_incasp_log, na.rm = TRUE)) 
+
+
+
+formula2 <- ldi_cat ~ tick_inf_zip_c + activity_casp_c + (tick_inf_zip_c*activity_casp_c) +
+  f(zip_id, model = "bym2", graph = g, scale.model = TRUE,
+    hyper = list(prec = list(prior = "pc.prec", param = c(1, 0.01)),
+      phi  = list(prior = "pc", param = c(0.5, 2/3))
+    ))
+
+result2 <- inla(
+  formula2,
+  family ="poisson",
+  data = zip_data2,
+  offset = total_pop_log, 
+  control.predictor = list(compute = TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE)
+)
+
+# fixed effects (main and interacio)
+result2 <- as.data.frame(result2)#$summary.fixed
+
+as.data.frame(result2$summary.fixed)
+# spatial hyperparams
+result2$summary.hyperpar
+
+spatial_effects <- result2$summary.random$zip_id
+
+zip_shp$spatial_mean <- spatial_effects$mean[
+  match(zip_shp$zip_id, spatial_effects$ID)
+]
+
+
+res2 <- result2
+library(ggplot2)
+
+fixed_df <- as.data.frame(res2)
+fixed_df$covariate <- rownames(fixed_df)
+
+fixed_df %>% 
+  filter(covariate != "(Intercept)") %>% 
+ggplot(aes(x=covariate, y=mean)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=`0.025quant`, ymax=`0.975quant`), width=0.2) +
+  coord_flip() +
+  geom_hline(yintercept = 0) +
+  theme_minimal() +
+  labs(title="Posterior estimates of fixed effects", y="Posterior mean", x="") 
+
+```
+now do it for all things aggregated within state park
+```{r}
+casp_slim <- read.csv("data/processed/casp_ldi_tick_annualmonthly.csv") %>% 
+  dplyr::select(UNITNAME,ldi_year_weightedavg_casp, tick_year_inf) %>% 
+  right_join(data_clean_analysis_monthly %>% dplyr::select(ZIP_CODE, UNITNAME)) %>% 
+  rename(zip_code = ZIP_CODE) %>% 
+  mutate(zip_code = as.character(zip_code)) %>% 
+  mutate(zip_code = str_pad(as.character(zip_code), 5, "left", "0")) %>% 
+  rename(tick_year_inf_casp = tick_year_inf)
+
+
+  
+
+zipcode_shp  %>% 
+  left_join(casp_slim)
+
+
+zip_data3 <- zip_data %>% 
+  left_join(casp_activity, by = "zip_code") %>% 
+  mutate(activity_annualtotal_incasp = tidyr::replace_na(activity_annualtotal_incasp, 0),
+         activity_annualtotal_incasp_log = log(activity_annualtotal_incasp+1),
+         activity_casp_c = activity_annualtotal_incasp_log - mean(activity_annualtotal_incasp_log, na.rm = TRUE)) %>% 
+  left_join(casp_slim) %>% 
+  mutate(tick_inf_casp_c = tick_year_inf_casp - mean(tick_year_inf_casp, na.rm = TRUE),
+         tick_inf_casp_c = tidyr::replace_na(tick_inf_casp_c, 0))
+
+
+formula3 <- ldi_cat ~ tick_inf_casp_c + activity_casp_c + (tick_inf_casp_c*activity_casp_c) +
+  f(zip_id, model = "bym2", graph = g, scale.model = TRUE,
+    hyper = list(prec = list(prior = "pc.prec", param = c(1, 0.01)),
+      phi  = list(prior = "pc", param = c(0.5, 2/3))
+    ))
+
+result3 <- inla(
+  formula3,
+  family ="", #"poisson",
+  data = zip_data3,
+  offset = total_pop_log, 
+  control.predictor = list(compute = TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE)
+)
+
+# fixed effects (main and interacio)
+result3 <- as.data.frame(result3$summary.fixed)#$summary.fixed
+
+res3 <- result3
+library(ggplot2)
+
+fixed_df <- as.data.frame(res3)
+fixed_df$covariate <- rownames(fixed_df)
+
+fixed_df %>% 
+  filter(covariate != "(Intercept)") %>% 
+ggplot(aes(x=covariate, y=mean)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=`0.025quant`, ymax=`0.975quant`), width=0.2) +
+  coord_flip() +
+  geom_hline(yintercept = 0) +
+  theme_minimal() +
+  labs(title="Posterior estimates of fixed effects", y="Posterior mean", x="") 
+
+
+```
+
+
+```{r}
+# Extract fixed effects summary from INLA model
+fixed_effects <- data.frame(
+  term = rownames(result3$summary.fixed),
+  mean = result3$summary.fixed$mean,
+  lower = result3$summary.fixed$`0.025quant`,
+  upper = result3$summary.fixed$`0.975quant`
+)
+
+ggplot(fixed_effects %>% filter(term != "(Intercept)"), aes(x = term, y = mean)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2) +
+  labs(title = "Fixed Effects Estimates with 95% Credible Intervals",
+       y = "Estimate (log scale)", x = "") +
+  theme_minimal()
+
+
+```
+
+
+
+```{r}
+################################################################################
+# BYM2 Model Workflow with INLA in R
+# A comprehensive debugging and implementation workflow
+################################################################################
+
+# Load required packages
+library(INLA)
+library(sf)
+library(spdep)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+################################################################################
+# STEP 1: DATA PREPARATION & FORMATTING
+################################################################################
+
+# 1.1 Load your spatial data (shapefile or other spatial format)
+ spatial_data <- zip_data_shp # st_read("your_shapefile.shp")
+
+# Make sure it has:
+# - A unique area ID
+# - Observed counts (Y)
+# - Expected counts (E) or population/offset
+# - Any covariates
+
+# 1.2 Create neighbor structure
+# Option A: Queen contiguity
+nb <- poly2nb(spatial_data, queen = TRUE) 
+
+# Option B: Rook contiguity
+# nb <- poly2nb(spatial_data, queen = FALSE)
+
+# DEBUG CHECK 1: Verify neighbor structure
+ summary(nb)
+# Check for areas with no neighbors (islands)
+ which(card(nb) == 0) #29   31  169  630 1005
+
+ # Find islands
+islands <- which(card(nb) == 0)
+
+library(sp)
+# For each island, connect to nearest neighbor
+for(i in islands) {
+  # Find nearest non-island neighbor
+  coords <- st_coordinates(st_centroid(spatial_data))
+  dists <- spDists(coords[i,, drop=FALSE], coords[-i,])
+  nearest <- which.min(dists)
+  
+  # Add symmetric neighbor relationship
+  nb[[i]] <- nearest
+  nb[[nearest]] <- sort(c(nb[[nearest]], i))
+}
+
+
+# 1.3 Convert to INLA format
+nb2INLA("map.adj", nb)
+ g <- inla.read.graph(filename = "map.adj")
+
+# DEBUG CHECK 2: Verify graph structure
+ plot(nb, coordinates(as_Spatial(spatial_data)))
+# Check: Does the neighbor structure make sense?
+
+# 1.4 Prepare the data frame
+ data_inla <- data.frame(
+   Y = spatial_data$ldi_cat,
+   E = spatial_data$total_pop_log,
+   area_id = 1:nrow(spatial_data),
+   area_id2 = 1:nrow(spatial_data),  # Duplicate for BYM2
+   covariate1 = spatial_data$tick_inf_zip_c,
+   covariate2 = spatial_data$activity_zip_c,
+   covariate3 = (spatial_data$tick_inf_zip_c*spatial_data$activity_zip_c)
+ )
+
+# DEBUG CHECK 3: Data sanity checks
+ summary(data_inla)
+ sum(is.na(data_inla))  # Check for missing values
+ sum(data_inla$Y < 0)   # Check for negative counts
+sum(data_inla$E <= 0)  # Check for non-positive expected values
+
+################################################################################
+# STEP 2: MODEL SPECIFICATION
+################################################################################
+
+# 2.1 Define the BYM2 formula
+# Simple model with offset
+ formula_simple <- Y ~ 1 + 
+   f(area_id, model = "bym2", graph = g, scale.model = TRUE)
+
+# Model with covariates
+ formula_full <- Y ~ 1 + covariate1*covariate2 + 
+   f(area_id, model = "bym2", graph = g, scale.model = TRUE,
+     hyper = list(
+       prec = list(prior = "pc.prec", param = c(1, 0.01)),
+       phi = list(prior = "pc", param = c(0.5, 0.5))
+     ))
+
+# 2.2 Define priors (optional - INLA has defaults)
+# BYM2 hyperparameters:
+# - prec: precision of combined spatial effect (PC prior recommended)
+# - phi: mixing parameter between spatial/unstructured (0=all unstructured, 1=all spatial)
+
+################################################################################
+# STEP 3: FIT THE MODEL
+################################################################################
+
+# 3.1 Fit the model
+ result <- inla(formula_full, 
+                family = "poisson",
+                data = data_inla,
+                E = E,  # Expected counts as offset
+                control.predictor = list(compute = TRUE),
+                control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+                control.inla = list(strategy = "simplified.laplace"))
+
+# DEBUG CHECK 4: Model convergence
+# Check for warnings during fitting
+# Look at result$mode$mode.status (should be 0 for successful convergence)
+result$mode$mode.status
+
+################################################################################
+# STEP 4: MODEL DIAGNOSTICS
+################################################################################
+
+# 4.1 Check model summary
+summary(result)
+
+# 4.2 Check hyperparameters
+result$summary.hyperpar
+# DEBUG: Are precision estimates reasonable? Is phi between 0 and 1?
+
+# 4.3 Check fixed effects
+result$summary.fixed
+# DEBUG: Do coefficient signs make sense? Are CIs reasonable?
+
+# 4.4 CPO/PIT for model checking
+ cpo_values <- result$cpo$cpo
+ pit_values <- result$cpo$pit
+
+
+# DEBUG CHECK 5: Identify problematic observations
+bad_cpo <- which(cpo_values < 0.01)  # Very low CPO indicates poor fit
+if(length(bad_cpo) > 0) {
+  cat("Areas with poor fit (CPO < 0.01):", bad_cpo, "\n")
+}
+
+# 4.5 PIT histogram (should be roughly uniform)
+ hist(pit_values, breaks = 20, main = "PIT Histogram",
+      xlab = "PIT values", col = "lightblue")
+ abline(h = length(pit_values)/20, col = "red", lty = 2)
+
+# DEBUG: Non-uniform PIT suggests model misspecification
+
+# 4.6 Model comparison metrics
+ cat("DIC:", result$dic$dic, "\n")
+ cat("WAIC:", result$waic$waic, "\n")
+ cat("Marginal log-likelihood:", result$mlik[1], "\n")
+
+ 
+ 
+################################################################################
+# STEP 5: EXTRACT RESULTS
+################################################################################
+
+# 5.1 Extract fitted values and residuals
+ fitted_values <- result$summary.fitted.values$mean
+ lower_ci <- result$summary.fitted.values$`0.025quant`
+ upper_ci <- result$summary.fitted.values$`0.975quant`
+
+# 5.2 Calculate SMRs (Standardized Morbidity/Mortality Ratios)
+# smr_observed <- data_inla$Y / data_inla$E
+# smr_fitted <- fitted_values / data_inla$E
+
+# 5.3 Extract random effects
+ spatial_effects <- result$summary.random$area_id
+ random_effect_mean <- spatial_effects$mean
+ random_effect_sd <- spatial_effects$sd
+
+# 5.4 Extract spatial fraction (phi)
+ phi_marginal <- inla.tmarginal(function(x) x, 
+                                 result$marginals.hyperpar$`Phi for area_id`)
+ phi_mean <- inla.emarginal(function(x) x, phi_marginal)
+ cat("Spatial fraction (phi):", phi_mean, "\n")
+# DEBUG: phi close to 0 = mostly unstructured, close to 1 = mostly spatial
+
+################################################################################
+# STEP 6: VISUALIZATION
+################################################################################
+
+# 6.1 Add results back to spatial data
+ spatial_data$smr_observed <- smr_observed
+ spatial_data$smr_fitted <- smr_fitted
+ spatial_data$random_effect <- random_effect_mean
+ spatial_data$cpo <- cpo_values
+
+# 6.2 Map observed SMR
+# ggplot(spatial_data) +
+#   geom_sf(aes(fill = smr_observed), color = "white", size = 0.1) +
+#   scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+#                        midpoint = 1, name = "SMR") +
+#   theme_minimal() +
+#   labs(title = "Observed SMR")
+
+# 6.3 Map fitted SMR
+# ggplot(spatial_data) +
+#   geom_sf(aes(fill = smr_fitted), color = "white", size = 0.1) +
+#   scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+#                        midpoint = 1, name = "Fitted SMR") +
+#   theme_minimal() +
+#   labs(title = "Fitted SMR (BYM2 Model)")
+
+# 6.4 Map random effects
+ ggplot(spatial_data) +
+   geom_sf(aes(fill = random_effect), color = "white", size = 0.1) +
+   scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                        midpoint = 0, name = "Effect") +
+   theme_minimal() +
+   labs(title = "Spatial Random Effects")
+
+# 6.5 Map CPO values (identify poorly fit areas)
+ ggplot(spatial_data) +
+   geom_sf(aes(fill = cpo), color = "white", size = 0.1) +
+   scale_fill_viridis_c(name = "CPO", option = "plasma") +
+   theme_minimal() +
+   labs(title = "CPO Values (Lower = Worse Fit)")
+
+# 6.6 Exceedance probabilities
+# threshold <- 1  # SMR threshold
+# prob_exceed <- sapply(1:nrow(data_inla), function(i) {
+#   1 - inla.pmarginal(threshold, result$marginals.fitted.values[[i]])
+# })
+# spatial_data$prob_exceed <- prob_exceed
+
+# ggplot(spatial_data) +
+#   geom_sf(aes(fill = prob_exceed), color = "white", size = 0.1) +
+#   scale_fill_gradient(low = "white", high = "darkred",
+#                       name = "P(SMR > 1)") +
+#   theme_minimal() +
+#   labs(title = "Probability of Elevated Risk")
+
+################################################################################
+# STEP 7: DEBUGGING COMMON ISSUES
+################################################################################
+
+# ISSUE 1: Model won't converge
+# - Check for islands in your graph (areas with no neighbors)
+# - Verify data quality (no NAs, negatives, zeros in wrong places)
+# - Try simpler priors
+# - Scale covariates to have mean 0, sd 1
+
+# ISSUE 2: Unreasonable hyperparameter estimates
+# - Check prior specifications
+# - Ensure scale.model = TRUE for BYM2
+# - Verify neighbor structure is correct
+
+# ISSUE 3: Poor model fit (bad CPO/PIT)
+# - Add relevant covariates
+# - Check for overdispersion (consider negative binomial)
+# - Examine outliers in the data
+# - Consider different spatial structures
+
+# ISSUE 4: Warnings about numerical precision
+# - Use control.inla = list(strategy = "gaussian", int.strategy = "eb")
+# - Increase diagonal value: control.inla = list(diagonal = 0.01)
+
+# ISSUE 5: Memory issues with large datasets
+# - Use control.inla = list(strategy = "adaptive")
+# - Reduce number of integration points
+# - Consider sparse matrices explicitly
+
+################################################################################
+# BONUS: MODEL COMPARISON EXAMPLE
+################################################################################
+
+# Compare models with different covariates
+# model1 <- inla(..., data = data_inla)
+# model2 <- inla(..., data = data_inla)
+
+# data.frame(
+#   Model = c("Model 1", "Model 2"),
+#   DIC = c(model1$dic$dic, model2$dic$dic),
+#   WAIC = c(model1$waic$waic, model2$waic$waic),
+#   Mean_CPO = c(mean(model1$cpo$cpo, na.rm=TRUE), 
+#                mean(model2$cpo$cpo, na.rm=TRUE))
+# )
+
+################################################################################
+# QUICK REFERENCE: BYM2 MODEL COMPONENTS
+################################################################################
+
+# BYM2 = Besag-York-Mollié version 2 model
+# Spatial effect = sqrt(1/prec) * (sqrt(phi) * u + sqrt(1-phi) * v)
+# where:
+#   u = structured spatial component (ICAR)
+#   v = unstructured component (iid)
+#   phi = mixing parameter (0 to 1)
+#   prec = precision of combined effect
+
+# Key advantages of BYM2 over BYM:
+# - Better identifiability
+# - scale.model = TRUE makes spatial variance interpretable
+# - phi parameter directly interpretable as spatial fraction
+
+print("BYM2 INLA Workflow loaded successfully!")
+print("Uncomment and adapt code sections as needed for your data.")
+
+
+any(is.na(result$summary.fixed))
+any(is.na(result$summary.hyperpar))
+
+# Extract fixed effects
+fixed_effects <- result$summary.fixed
+
+# Create plotting data
+coef_data <- data.frame(
+  variable = rownames(fixed_effects),
+  mean = fixed_effects$mean,
+  lower = fixed_effects$`0.025quant`,
+  upper = fixed_effects$`0.975quant`
+)
+
+# Remove intercept (usually not interesting to show)
+coef_data <- coef_data[coef_data$variable != "(Intercept)", ]
+
+# Better labels (customize these!)
+coef_data$variable <- factor(coef_data$variable,
+                              levels = c("covariate3", "covariate2", "covariate1"),
+                              labels = c("Covariate 3", "Covariate 2", "Covariate 1"))
+
+# Plot on LOG scale
+ggplot(coef_data, aes(x = mean, y = variable)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  geom_errorbarh(aes(xmin = lower, xmax = upper), height = 0.2, linewidth = 1) +
+  geom_point(size = 3, color = "steelblue") +
+  labs(x = "Log Relative Risk (95% CI)", 
+       y = NULL,
+       title = "Fixed Effect Estimates") +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank())
+```
+try doing this with activity within zip code
+```{r}
+
+  
+zip_data_shp2 <- zip_data_shp %>% 
+  left_join(casp_activity, by = "zip_code") %>% 
+  mutate(activity_annualtotal_incasp = tidyr::replace_na(activity_annualtotal_incasp, 0),
+         activity_annualtotal_incasp_log = log(activity_annualtotal_incasp+1),
+         activity_casp_c = activity_annualtotal_incasp_log - mean(activity_annualtotal_incasp_log, na.rm = TRUE))
+
+ spatial_data <- zip_data_shp2 # st_read("your_shapefile.shp")
+ 
+ 
+# Add zeros for zip codes with no parks
+spatial_data$activity_park_with_zeros <- ifelse(
+  is.na(spatial_data$activity_annualtotal_incasp) | spatial_data$num_parks == 0,
+  0,
+  spatial_data$activity_annualtotal_incasp
+)
+
+# Scale (with zeros included)
+spatial_data$activity_park_c <- scale(spatial_data$activity_park_with_zeros)[,1]
+
+
+ # 1.2 Create neighbor structure
+# Option A: Queen contiguity
+nb <- poly2nb(spatial_data, queen = TRUE) 
+
+# Option B: Rook contiguity
+# nb <- poly2nb(spatial_data, queen = FALSE)
+
+# DEBUG CHECK 1: Verify neighbor structure
+ summary(nb)
+# Check for areas with no neighbors (islands)
+ which(card(nb) == 0) #29   31  169  630 1005
+
+ # Find islands
+islands <- which(card(nb) == 0)
+
+library(sp)
+# For each island, connect to nearest neighbor
+for(i in islands) {
+  # Find nearest non-island neighbor
+  coords <- st_coordinates(st_centroid(spatial_data))
+  dists <- spDists(coords[i,, drop=FALSE], coords[-i,])
+  nearest <- which.min(dists)
+  
+  # Add symmetric neighbor relationship
+  nb[[i]] <- nearest
+  nb[[nearest]] <- sort(c(nb[[nearest]], i))
+}
+
+
+# 1.3 Convert to INLA format
+nb2INLA("map.adj", nb)
+ g <- inla.read.graph(filename = "map.adj")
+
+# DEBUG CHECK 2: Verify graph structure
+ plot(nb, coordinates(as_Spatial(spatial_data)))
+# Check: Does the neighbor structure make sense?
+
+# 1.4 Prepare the data frame
+ data_inla <- data.frame(
+   Y = spatial_data$ldi_cat,
+   E = spatial_data$total_pop_log,
+   area_id = 1:nrow(spatial_data),
+   area_id2 = 1:nrow(spatial_data),  # Duplicate for BYM2
+   covariate1 = spatial_data$tick_inf_zip_c,
+   covariate2 = spatial_data$activity_casp_c
+ )
+
+# DEBUG CHECK 3: Data sanity checks
+ summary(data_inla)
+ sum(is.na(data_inla))  # Check for missing values
+ sum(data_inla$Y < 0)   # Check for negative counts
+sum(data_inla$E <= 0)  # Check for non-positive expected values
+
+################################################################################
+# STEP 2: MODEL SPECIFICATION
+################################################################################
+
+# 2.1 Define the BYM2 formula
+# Simple model with offset
+ formula_simple <- Y ~ 1 + 
+   f(area_id, model = "bym2", graph = g, scale.model = TRUE)
+
+# Model with covariates
+ formula_full <- Y ~ 1 + covariate1*covariate2 + 
+   f(area_id, model = "bym2", graph = g, scale.model = TRUE,
+     hyper = list(
+       prec = list(prior = "pc.prec", param = c(1, 0.01)),
+       phi = list(prior = "pc", param = c(0.5, 0.5))
+     ))
+
+# 2.2 Define priors (optional - INLA has defaults)
+# BYM2 hyperparameters:
+# - prec: precision of combined spatial effect (PC prior recommended)
+# - phi: mixing parameter between spatial/unstructured (0=all unstructured, 1=all spatial)
+
+################################################################################
+# STEP 3: FIT THE MODEL
+################################################################################
+
+# 3.1 Fit the model
+ result <- inla(formula_full, 
+                family = "poisson",
+                data = data_inla,
+                E = E,  # Expected counts as offset
+                control.predictor = list(compute = TRUE),
+                control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+                control.inla = list(strategy = "simplified.laplace"))
+
+# DEBUG CHECK 4: Model convergence
+# Check for warnings during fitting
+# Look at result$mode$mode.status (should be 0 for successful convergence)
+result$mode$mode.status
+
+################################################################################
+# STEP 4: MODEL DIAGNOSTICS
+################################################################################
+
+# 4.1 Check model summary
+summary(result)
+
+# 4.2 Check hyperparameters
+result$summary.hyperpar
+# DEBUG: Are precision estimates reasonable? Is phi between 0 and 1?
+
+# 4.3 Check fixed effects
+result$summary.fixed
+# DEBUG: Do coefficient signs make sense? Are CIs reasonable?
+
+# 4.4 CPO/PIT for model checking
+ cpo_values <- result$cpo$cpo
+ pit_values <- result$cpo$pit
+
+
+# DEBUG CHECK 5: Identify problematic observations
+bad_cpo <- which(cpo_values < 0.01)  # Very low CPO indicates poor fit
+if(length(bad_cpo) > 0) {
+  cat("Areas with poor fit (CPO < 0.01):", bad_cpo, "\n")
+}
+
+# 4.5 PIT histogram (should be roughly uniform)
+ hist(pit_values, breaks = 20, main = "PIT Histogram",
+      xlab = "PIT values", col = "lightblue")
+ abline(h = length(pit_values)/20, col = "red", lty = 2)
+
+# DEBUG: Non-uniform PIT suggests model misspecification
+
+# 4.6 Model comparison metrics
+ cat("DIC:", result$dic$dic, "\n")
+ cat("WAIC:", result$waic$waic, "\n")
+ cat("Marginal log-likelihood:", result$mlik[1], "\n")
+
+ 
+ 
+################################################################################
+# STEP 5: EXTRACT RESULTS
+################################################################################
+
+# 5.1 Extract fitted values and residuals
+ fitted_values <- result$summary.fitted.values$mean
+ lower_ci <- result$summary.fitted.values$`0.025quant`
+ upper_ci <- result$summary.fitted.values$`0.975quant`
+
+# 5.2 Calculate SMRs (Standardized Morbidity/Mortality Ratios)
+# smr_observed <- data_inla$Y / data_inla$E
+# smr_fitted <- fitted_values / data_inla$E
+
+# 5.3 Extract random effects
+ spatial_effects <- result$summary.random$area_id
+ random_effect_mean <- spatial_effects$mean
+ random_effect_sd <- spatial_effects$sd
+
+# 5.4 Extract spatial fraction (phi)
+ phi_marginal <- inla.tmarginal(function(x) x, 
+                                 result$marginals.hyperpar$`Phi for area_id`)
+ phi_mean <- inla.emarginal(function(x) x, phi_marginal)
+ cat("Spatial fraction (phi):", phi_mean, "\n")
+# DEBUG: phi close to 0 = mostly unstructured, close to 1 = mostly spatial
+
+################################################################################
+# STEP 6: VISUALIZATION
+################################################################################
+
+# 6.1 Add results back to spatial data
+ spatial_data$smr_observed <- smr_observed
+ spatial_data$smr_fitted <- smr_fitted
+ spatial_data$random_effect <- random_effect_mean
+ spatial_data$cpo <- cpo_values
+
+# 6.2 Map observed SMR
+# ggplot(spatial_data) +
+#   geom_sf(aes(fill = smr_observed), color = "white", size = 0.1) +
+#   scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+#                        midpoint = 1, name = "SMR") +
+#   theme_minimal() +
+#   labs(title = "Observed SMR")
+
+# 6.3 Map fitted SMR
+# ggplot(spatial_data) +
+#   geom_sf(aes(fill = smr_fitted), color = "white", size = 0.1) +
+#   scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+#                        midpoint = 1, name = "Fitted SMR") +
+#   theme_minimal() +
+#   labs(title = "Fitted SMR (BYM2 Model)")
+
+# 6.4 Map random effects
+ ggplot(spatial_data) +
+   geom_sf(aes(fill = random_effect), color = "white", size = 0.1) +
+   scale_fill_gradient2(low = "blue", mid = "white", high = "red",
+                        midpoint = 0, name = "Effect") +
+   theme_minimal() +
+   labs(title = "Spatial Random Effects")
+
+# 6.5 Map CPO values (identify poorly fit areas)
+ ggplot(spatial_data) +
+   geom_sf(aes(fill = cpo), color = "white", size = 0.1) +
+   scale_fill_viridis_c(name = "CPO", option = "plasma") +
+   theme_minimal() +
+   labs(title = "CPO Values (Lower = Worse Fit)")
+
+ 
+```

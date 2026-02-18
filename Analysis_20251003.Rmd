@@ -1,0 +1,569 @@
+---
+title: "Analysis_20251003"
+output: html_document
+date: "2025-10-03"
+---
+
+this is spatial results that are good!!
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(sf)
+library(spdep)
+library(INLA)
+library(janitor)
+library(tigris)
+library(tidycensus)
+
+ldi <- st_read("data/raw/LD_incidence/CA_Zips_Lyme_NAD83.shp")
+ca_shp <- counties(state = "CA", cb = TRUE, class = "sf")
+ca_total_pop <- read.delim("data/raw/cademographics_totalpop.csv") 
+
+# covariate
+zipcode_fulldata_annual <- st_read("data/processed/zipcode_fulldata_annual.gpkg") 
+casp_fulldata_annual <- st_read("data/processed/casp_fulldata_annual.gpkg")
+
+```
+
+
+Clean data
+```{r}
+## fix LDI data
+# correct CRS to match ca_shp (how covariates were aggregated)
+# change LDI cat to midpoint integer values
+# unique(ldi_4269$ldi_cat)
+# 0   1   5 100  10  20  50
+ldi_4269 <- st_transform(ldi, crs = 4269) %>% 
+   dplyr::select(ZIP_CODE, PO_NAME, LDI_Cat, geometry) %>% 
+  clean_names() %>% 
+  mutate(ldi_lowercat = case_when(ldi_cat == 0 ~ 0,
+                                    ldi_cat == 1 ~ 0.01,
+                                    ldi_cat == 5 ~ 1.01,
+                                    ldi_cat == 10 ~ 5.01,
+                                    ldi_cat == 20 ~ 10.01,
+                                    ldi_cat == 50 ~ 20.01,
+                                    ldi_cat == 100 ~ 50.01),
+           ldi_midcat_raw = case_when(ldi_cat == 0 ~ 0,
+                                  ldi_cat == 1 ~ 0.505,
+                                  ldi_cat == 5 ~ 3.005,
+                                  ldi_cat == 10 ~ 7.505,
+                                  ldi_cat == 20 ~ 15.005,
+                                  ldi_cat == 50 ~ 35.005,
+                                  ldi_cat == 100 ~ 75),
+           ldi_midcat_int = round(ldi_midcat_raw))
+
+# check for NAs
+ldi_4269 %>% filter(is.na(ldi_midcat_int))
+
+# check polygons are touching
+#ldi_4269 %>% st_touches()
+sum(!st_is_valid(ldi_4269)) # 2 are not valid 
+sum(!st_is_valid(ldi_4269 %>% st_make_valid())) # 0 are not valid
+
+# make clean shp 
+ldi_clean <- ldi_4269 %>% st_make_valid()
+
+length(unique(ldi_clean$zip_code)) # 1721
+```
+
+upload population data from ACS
+```{r}
+
+# https://gis.data.ca.gov/datasets/California::ca-zip-code-boundaries/explore?location=0.079330%2C0.315600%2C0.04&showTable=true
+# https://www.unitedstateszipcodes.org/96063/#stats
+
+ca_total_pop <- ca_total_pop %>% 
+  mutate(zip_code = str_pad(zip_code, width = 5, side = "left", pad = "0")) #%>% dplyr::select(-po_name)
+
+
+ldi_clean2 <- ldi_clean %>% 
+  left_join(ca_total_pop,by = "zip_code") %>% 
+  mutate(total_pop = case_when("po_name" == "Sierra National Forest" ~ 0,
+                               "zip_code" == "90822" ~ 54,
+                               "zip_code" == "96063" ~ 125,
+                               TRUE ~ total_pop))
+
+## okay all populations are filled in and ldi category
+```
+
+
+Fix case data
+```{r}
+## tranform reported incidence data into format for analysis
+# Zip code level LDI was calculated by Eisen et al 2006b as the mean annual incidence of endemic LD for the period 1993–2005, dropping cases within that date range where the likely county of exposure did not match county of residence, or for which residential zip code information was missing. Eisen et al reported LDI by zip code per 100.000 population
+
+# estimate total cases from incidence
+ldi_clean3 <- ldi_clean2 %>% 
+  mutate(ldi_totalcases = (ldi_midcat_raw/100000) * total_pop * 13, # changed from _int to _raw
+         Y = round(ldi_totalcases)) 
+
+#ldi_clean3 %>% filter(is.na(Y)) 0
+
+# calculate total observed cases and total population-time 
+# to get global rate per person per year
+total_y <- sum(ldi_clean3$Y, na.rm = TRUE) # 2629
+total_popyears <- sum(ldi_clean3$total_pop * 13, na.rm = TRUE)
+global_rate <- total_y/total_popyears
+
+# calculate expected counts per zip code
+E <- (ldi_clean3$total_pop *13 * global_rate)
+E <- pmax(E, 0.001) # prevent poisson model failing
+
+# add back to dataset
+# check same length
+length(E) #1721
+nrow(ldi_clean3) # 1721
+
+ldi_clean3$E <- E
+
+## make slim dataframe for model
+ldi_slim <- ldi_clean3 %>% 
+  dplyr::select(zip_code, Y, E)
+```
+
+Now work on covariates
+```{r}
+## at zipcode level
+zipcode_annual_slim <- zipcode_fulldata_annual  %>% 
+  st_drop_geometry()  %>% 
+  mutate(meta_activity = replace_na(meta_activity, 0),
+         tickinf_prob = replace_na(tickinf_prob, 0)) %>% 
+  mutate(log_tickinf_prob = log(tickinf_prob+1)) %>% # add log transformation
+  mutate(meta_activity_z = scale(meta_activity),
+         tickinf_prob_z = scale(log_tickinf_prob)) %>% 
+  dplyr::select(zip_code, meta_activity_z, tickinf_prob_z) %>% 
+  rename(zip_meta_activity_z = meta_activity_z,
+         zip_tickinf_prob_z = tickinf_prob_z) 
+  
+## park averaged within zipcode
+
+casp_annual_summary <- casp_fulldata_annual %>% 
+  mutate(meta_activity = meta_year_max_activity, #replace_na(meta_year_max_activity, 0),
+        tickinf_prob = tick_year_inf) %>%  #replace_na(tick_year_inf, 0)) 
+  mutate(log_tickinf_prob = log(tickinf_prob+1)) %>% # add log transformation
+    st_make_valid() %>% 
+  group_by(UNITNAME) %>% 
+  summarise(mean_tickinf_prob = mean(log_tickinf_prob, na.rm = TRUE),
+            mean_meta_activity = mean(meta_activity, na.rm = TRUE)) %>% 
+  st_transform(st_crs(ldi_slim)) 
+
+# see which parks belong in which zipcodes
+zip_casp_annual_summary <- st_join(ldi_slim, casp_annual_summary, join = st_intersects) 
+
+# now aggregate csp covariates to zip level
+zip_casp_annual_clean <- zip_casp_annual_summary %>%
+  group_by(zip_code) %>% 
+  summarise(mean_meta_activity = mean(mean_meta_activity, na.rm = TRUE),
+            mean_tickinf_prob = mean(mean_tickinf_prob, na.rm = TRUE)) %>% 
+  #mutate(mean_meta_activity = replace_na(mean_meta_activity, 0),
+  #       mean_tickinf_prob = replace_na(mean_tickinf_prob, 0)) %>% 
+  mutate(casp_meta_activity_z = scale(mean_meta_activity),
+         casp_tickinf_prob_z = scale(mean_tickinf_prob))
+
+zip_casp_annual_slim <- zip_casp_annual_clean %>% 
+  dplyr::select(zip_code, casp_meta_activity_z, casp_tickinf_prob_z) %>% 
+  st_drop_geometry()
+```
+
+another attempt to take park information (havent done this yet)
+```{r}
+# weighted average by area overlap
+# add buffer
+ casp_annual_summary_buffer <- st_transform(casp_annual_summary, 26910) %>%
+  st_buffer(dist = 1000) %>% # 1 km
+  st_transform(st_crs(ldi_slim)) %>% 
+  st_make_valid()
+
+# find intersections
+zip_casp_intersections <- st_intersection(ldi_slim, casp_annual_summary_buffer)
+
+# compute area of intersection
+zip_casp_intersections <- zip_casp_intersections %>%
+  mutate(intersection_area = st_area(geometry))
+
+# group by zip code and normalize areas to get weight
+zip_casp_intersections <- zip_casp_intersections %>%
+  group_by(zip_code) %>%
+  mutate(weight = as.numeric(intersection_area) / sum(as.numeric(intersection_area), na.rm = TRUE)) %>%
+  ungroup()
+
+# compute weighted averages
+zip_casp_weighted <- zip_casp_intersections %>%
+  mutate(weighted_meta = mean_meta_activity * weight,
+         weighted_tick = mean_tickinf_prob * weight) %>%
+  group_by(zip_code) %>%
+  summarise(mean_meta_activity = sum(weighted_meta, na.rm = TRUE),
+            mean_tickinf_prob = sum(weighted_tick, na.rm = TRUE))
+
+# handle ZIPS that had no park overlaps
+zip_casp_weighted_clean <- ldi_slim %>%
+  st_drop_geometry() %>%
+  dplyr::select(zip_code) %>%
+  left_join(zip_casp_weighted, by = "zip_code") %>%
+  mutate(across(c(mean_meta_activity, mean_tickinf_prob), ~replace_na(., 0)))
+
+
+# scale covariates
+zip_casp_weighted_final <- zip_casp_weighted_clean %>%
+  mutate(casp_meta_activity_z = scale(mean_meta_activity),
+         casp_tickinf_prob_z = scale(mean_tickinf_prob)) %>%
+  dplyr::select(zip_code, casp_meta_activity_z, casp_tickinf_prob_z)
+```
+
+Add covariates to LDI dataframe
+```{r}
+ldi_annual_zip_model <- ldi_slim %>% 
+  left_join(zipcode_annual_slim, by = "zip_code") %>% 
+  left_join(zip_casp_annual_slim , by = "zip_code") %>% 
+  st_make_valid() %>% 
+  # get rid of troublesome polygons
+  filter(zip_code != "00057"&
+         zip_code != "00061"&
+         zip_code != "90704"&
+         zip_code != "92662"&
+         zip_code != "94130")
+
+#sum(!st_is_valid(ldi_annual_zip_model)) 
+
+
+# zipcode 00057 (channel island national park),
+# 00061 (channel is air gaurd) 90704 (avalon) 92662 (newport beach) 94130 (alameda)
+# See the corresponding rows
+
+# now add ID
+ldi_annual_zip_model$ID <- 1:nrow(ldi_annual_zip_model)
+ldi_annual_zip_model$ID <- as.integer(as.factor(ldi_annual_zip_model$ID))
+
+```
+
+Create adjacency matrix
+```{r}
+# make SpatialPolygonsDataFrame 
+zip_sp <- as_Spatial(ldi_annual_zip_model)
+
+# make matrix of neighbors 
+nb <- poly2nb(zip_sp, row.names = as.character(ldi_annual_zip_model$ID)) 
+# ^ removing zipcodes earlier helped, now there's no isolated polygons
+
+# save files
+nb2INLA("zip.adj", nb)
+adjacency <- "zip.adj"
+
+
+```
+
+Fit BYM2 spatial model using INLA
+```{r}
+## ZIP CODE model
+# write formula
+
+zip_formula <- Y ~ zip_meta_activity_z + zip_tickinf_prob_z + (zip_meta_activity_z*zip_tickinf_prob_z) + 
+  f(ID, model = "bym2", graph = adjacency, scale.model = TRUE)
+
+zip_result_nb <- inla(zip_formula,
+                      family = "nbinomial",
+                      data = ldi_annual_zip_model,
+                      E = E,
+                      control.predictor = list(compute = TRUE, link = 1),
+                      control.compute = list(dic = TRUE, waic = TRUE,
+                                             return.marginals.predictor = TRUE),
+                      control.inla = list(strategy = "laplace", 
+                                          control.vb = list(enable = FALSE)))
+
+## Park model 
+zip_casp_formula <- Y ~ casp_meta_activity_z + casp_tickinf_prob_z + (casp_meta_activity_z*casp_tickinf_prob_z) + 
+  f(ID, model = "bym2", graph = adjacency, scale.model = TRUE)
+
+zip_casp_result_nb <- inla(zip_casp_formula,
+                      family = "nbinomial",
+                      data = ldi_annual_zip_model,
+                      E = E,
+                      control.predictor = list(compute = TRUE, link = 1),
+                      control.compute = list(dic = TRUE, waic = TRUE,
+                                             return.marginals.predictor = TRUE),
+                      control.inla = list(strategy = "laplace", 
+                                          control.vb = list(enable = FALSE)))
+```
+
+
+
+
+```{r} 
+## zip code model
+summary(zip_result_nb)
+summary(zip_result_nb)$fixed # fixed effect
+summary(zip_result_nb)$random$ID # spatial random effect
+zip_result_nb$summary.fitted.values # posterior predictions
+
+## park model
+summary(zip_casp_result_nb)$fixed
+```
+Extract results
+```{r}
+## Relative Risk
+ldi_annual_zip_model$RRmean <- zip_result_nb$summary.fitted.values$mean
+
+# ZIP code-level model
+coefs_zip <- as.data.frame(summary(zip_result_nb)$fixed)
+coefs_zip$term <- rownames(coefs_zip)
+coefs_zip$model <- "ZIP Code Level"
+
+```
+
+Visualize
+```{r}
+
+
+# Extract fixed effects from ZIP code model
+coefs_zip <- as.data.frame(summary(zip_result_nb)$fixed) %>%
+  rownames_to_column(var = "term") %>%
+  mutate(model = "ZIP Code Model")
+
+# Extract fixed effects from Park model
+coefs_casp <- as.data.frame(summary(zip_casp_result_nb)$fixed) %>%
+  rownames_to_column(var = "term") %>%
+  mutate(model = "Park Model")
+
+# Combine
+coefs_combined <- bind_rows(coefs_zip, coefs_casp)
+
+# Optional: clean up term names for nicer plotting
+coefs_combined <- coefs_combined %>%
+  mutate(term = case_when(
+    term == "(Intercept)" ~ "Intercept",
+    term == "zip_meta_activity_z" | term == "casp_meta_activity_z" ~ "Meta Activity (z)",
+    term == "zip_tickinf_prob_z" | term == "casp_tickinf_prob_z" ~ "Tick Infection Prob (z)",
+    term == "zip_meta_activity_z:zip_tickinf_prob_z" | term == "casp_meta_activity_z:casp_tickinf_prob_z" ~ "Interaction",
+    TRUE ~ term
+  ))
+
+coefs_combined %>% 
+  filter(term != "Intercept") %>% 
+ggplot( aes(x = term, y = mean, color = model)) +
+  geom_point(position = position_dodge(width = 0.6), size = 3) +
+  geom_errorbar(aes(ymin = `0.025quant`, ymax = `0.975quant`), 
+                position = position_dodge(width = 0.6), width = 0.2) +
+  labs(title = "Comparison of Fixed Effects: ZIP vs Park Models",
+       x = "Coefficient",
+       y = "Estimate (Posterior Mean)",
+       color = "Model") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  geom_hline(yintercept = 0)
+
+```
+check out sensitivity like caroline suggested
+```{r}
+# 1. Full model: casp_tick + casp_meta + interaction
+mod_full_casp <- inla(
+  Y ~ casp_meta_activity_z + casp_tickinf_prob_z + casp_meta_activity_z * casp_tickinf_prob_z +
+    f(ID, model = "bym2", graph = adjacency, scale.model = TRUE),
+  family = "nbinomial",
+  data = ldi_annual_zip_model,
+  E = E,
+  control.predictor = list(compute = TRUE, link = 1),
+  control.compute = list(dic = TRUE, waic = TRUE, return.marginals.predictor = TRUE),
+  control.inla = list(strategy = "laplace")
+)
+
+# 2. No interaction
+mod_nointer_casp <- inla(
+  Y ~ casp_meta_activity_z + casp_tickinf_prob_z +
+    f(ID, model = "bym2", graph = adjacency, scale.model = TRUE),
+  family = "nbinomial",
+  data = ldi_annual_zip_model,
+  E = E,
+  control.predictor = list(compute = TRUE, link = 1),
+  control.compute = list(dic = TRUE, waic = TRUE, return.marginals.predictor = TRUE),
+  control.inla = list(strategy = "laplace")
+)
+
+# 3. Tick-only model
+mod_tickonly_casp <- inla(
+  Y ~ casp_tickinf_prob_z +
+    f(ID, model = "bym2", graph = adjacency, scale.model = TRUE),
+  family = "nbinomial",
+  data = ldi_annual_zip_model,
+  E = E,
+  control.predictor = list(compute = TRUE, link = 1),
+  control.compute = list(dic = TRUE, waic = TRUE, return.marginals.predictor = TRUE),
+  control.inla = list(strategy = "laplace")
+)
+
+# 4. Meta-only model
+mod_metaonly_casp <- inla(
+  Y ~ casp_meta_activity_z +
+    f(ID, model = "bym2", graph = adjacency, scale.model = TRUE),
+  family = "nbinomial",
+  data = ldi_annual_zip_model,
+  E = E,
+  control.predictor = list(compute = TRUE, link = 1),
+  control.compute = list(dic = TRUE, waic = TRUE, return.marginals.predictor = TRUE),
+  control.inla = list(strategy = "laplace")
+)
+
+# 5. Spatial-only model (no covariates)
+mod_spatialonly_casp <- inla(
+  Y ~ 1 +
+    f(ID, model = "bym2", graph = adjacency, scale.model = TRUE),
+  family = "nbinomial",
+  data = ldi_annual_zip_model,
+  E = E,
+  control.predictor = list(compute = TRUE, link = 1),
+  control.compute = list(dic = TRUE, waic = TRUE, return.marginals.predictor = TRUE),
+  control.inla = list(strategy = "laplace"))
+
+# save to separate dataset from main one
+ldi_annual_zip_model2 <- ldi_annual_zip_model
+## extract relative risk
+ldi_annual_zip_model2$RR_full <- mod_full_casp$summary.fitted.values$mean
+ldi_annual_zip_model2$RR_nointer <- mod_nointer_casp$summary.fitted.values$mean
+ldi_annual_zip_model2$RR_tick <- mod_tickonly_casp$summary.fitted.values$mean
+ldi_annual_zip_model2$RR_meta <- mod_metaonly_casp$summary.fitted.values$mean
+ldi_annual_zip_model2$RR_spatial <- mod_spatialonly_casp$summary.fitted.values$mean
+
+# compare DIC/WAIC
+model_comp <- tibble::tibble(
+  model = c("Full", "No Interaction", "Tick Only", "Meta Only", "Spatial Only"),
+  DIC = c(mod_full_casp$dic$dic,
+          mod_nointer_casp$dic$dic,
+          mod_tickonly_casp$dic$dic,
+          mod_metaonly_casp$dic$dic,
+          mod_spatialonly_casp$dic$dic),
+  WAIC = c(mod_full_casp$waic$waic,
+           mod_nointer_casp$waic$waic,
+           mod_tickonly_casp$waic$waic,
+           mod_metaonly_casp$waic$waic,
+           mod_spatialonly_casp$waic$waic))
+
+#model_comp %>% arrange(desc(WAIC))
+
+
+
+## plot coeffiecients
+# Helper function to extract and label fixed effects
+extract_fixed_effects <- function(model, model_name) {
+  summary_df <- as.data.frame(model$summary.fixed)
+  summary_df$term <- rownames(summary_df)
+  summary_df$model <- model_name
+  rownames(summary_df) <- NULL
+  summary_df
+}
+
+# Extract from each model
+coefs_full <- extract_fixed_effects(mod_full_casp, "Full")
+coefs_nointer <- extract_fixed_effects(mod_nointer_casp, "No Interaction")
+coefs_tick <- extract_fixed_effects(mod_tickonly_casp, "Tick Only")
+coefs_meta <- extract_fixed_effects(mod_metaonly_casp, "Meta Only")
+coefs_spatial <- extract_fixed_effects(mod_spatialonly_casp, "Spatial Only")
+
+# Combine
+coefs_all <- bind_rows(coefs_full, coefs_nointer, coefs_tick, coefs_meta, coefs_spatial)
+
+
+coefs_all$term_clean <- recode(coefs_all$term,
+  "(Intercept)" = "Intercept",
+  "casp_meta_activity_z" = "Meta Activity (z)",
+  "casp_tickinf_prob_z" = "Tick Inf Prob (z)",
+  "casp_meta_activity_z:casp_tickinf_prob_z" = "Interaction")
+
+ggplot(coefs_all, aes(x = term_clean, y = mean, ymin = `0.025quant`, ymax = `0.975quant`,
+                      color = model, group = model)) +
+  geom_pointrange(position = position_dodge(width = 0.5)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(title = "Fixed Effects Coefficients Across Models",
+       x = "Covariate",
+       y = "Estimate (Posterior Mean with 95% CI)",
+       color = "Model") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+now visualize it in space
+```{r}
+ldi_annual_zip_model2$RR_full <- mod_full_casp$summary.fitted.values$mean
+ldi_annual_zip_model2$RR_nointer <- mod_nointer_casp$summary.fitted.values$mean
+ldi_annual_zip_model2$RR_tick <- mod_tickonly_casp$summary.fitted.values$mean
+ldi_annual_zip_model2$RR_meta <- mod_metaonly_casp$summary.fitted.values$mean
+ldi_annual_zip_model2$RR_spatial <- mod_spatialonly_casp$summary.fitted.values$mean
+
+
+library(patchwork)  # for combining plots
+
+plot_rr <- function(data, col, title) {
+  ggplot(data) +
+    geom_sf(aes_string(fill = col), color = NA) +
+    scale_fill_viridis_c(option = "C", direction = -1) +
+    theme_void() +
+    labs(title = title, fill = "RR")
+}
+
+p1 <- plot_rr(ldi_annual_zip_model2, "RR_full", "Full Model")
+p2 <- plot_rr(ldi_annual_zip_model2, "RR_nointer", "No Interaction")
+p3 <- plot_rr(ldi_annual_zip_model2, "RR_tick", "Tick Only")
+p4 <- plot_rr(ldi_annual_zip_model2, "RR_meta", "Meta Only")
+p5 <- plot_rr(ldi_annual_zip_model2, "RR_spatial", "Spatial Only")
+
+# Combine side-by-side or in grid
+(p1 | p2) / (p3 | p4)
+
+
+
+## try difference maps sensitivity
+ldi_annual_zip_model2 <- ldi_annual_zip_model2 %>%
+  mutate(diff_full_vs_tick = RR_full - RR_tick,
+         diff_full_vs_meta = RR_full - RR_meta,
+         diff_full_vs_spatial = RR_full - RR_spatial)
+
+plot_diff <- function(data, col, title) {
+  ggplot(data) +
+    geom_sf(aes_string(fill = col), color = NA) +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+    theme_void() +
+    labs(title = title, fill = "Δ RR") +
+    coord_sf(xlim = )
+}
+
+d1 <- plot_diff(ldi_annual_zip_model2, "diff_full_vs_tick", "Full - Tick Only") 
+d2 <- plot_diff(ldi_annual_zip_model2, "diff_full_vs_meta", "Full - Meta Only")
+d3 <- plot_diff(ldi_annual_zip_model2, "diff_full_vs_spatial", "Full - Spatial Only")
+
+(d1 | d2 | d3)
+
+
+plot_diff_norcal <- function(data, col, title) {
+  ggplot(data) +
+    geom_sf(aes_string(fill = col), color = NA) +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+    coord_sf(xlim = c(-124.5, -119.5), ylim = c(38.0, 42.8), expand = FALSE) +
+    theme_void() +
+    labs(title = title, fill = "Δ RR")
+}
+d1_north <- plot_diff_norcal(ldi_annual_zip_model2, "diff_full_vs_tick", "Full - Tick Only")
+d2_north <- plot_diff_norcal(ldi_annual_zip_model2, "diff_full_vs_meta", "Full - Meta Only")
+d3_north <- plot_diff_norcal(ldi_annual_zip_model2, "diff_full_vs_spatial", "Full - Spatial Only")
+
+deltaRR_norcal <- (d1_north | d2_north | d3_north)
+
+ggsave(deltaRR_norcal, file = "figures/deltaRR_norcal.png")
+
+```
+
+^^^^ the spatial stuff works and should be used for results
+
+
+```{r}
+ggplot(as.data.frame(zip_casp_result_nb$marginals.fixed$`casp_meta_activity_z:casp_tickinf_prob_z`)) +
+  geom_line(aes(x = x, y = y))
+
+ggplot(as.data.frame(zip_casp_result_nb$marginals.hyperpar[[3]])) +
+  geom_line(aes(x = x, y = y))
+
+1- inla.pmarginal(0, zip_casp_result_nb$marginals.fixed$`casp_meta_activity_z:casp_tickinf_prob_z`)
+#  0.9943296 probability of its coefficient being higher than one
+
+#For the precision, an 95% highest posterior density (HPD) credible interval could be computed:
+inla.hpdmarginal(0.95,zip_casp_result_nb$marginals.hyperpar[[1]] )
+```

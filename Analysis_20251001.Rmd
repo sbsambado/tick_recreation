@@ -1,0 +1,3814 @@
+---
+title: "preliminary analysis"
+output: html_document
+date: "2025-10-01"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(spdep)
+library(spatialreg)
+library(tmap)
+library(tidyverse)
+
+
+
+casp_fulldata_annual <- st_read("data/processed/casp_fulldata_annual.gpkg") %>% 
+  mutate(index = tick_year_inf*meta_year_max_activity) %>% 
+  st_make_valid()
+
+zipcode_fulldata_annual <- st_read("data/processed/zipcode_fulldata_annual.gpkg") %>% 
+  mutate(index = tickinf_prob*meta_activity) %>% 
+  st_make_valid()
+```
+
+```{r}
+
+nb <- poly2nb(zipcode_fulldata_annual,snap = 0.01)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+moran.test(zipcode_fulldata_annual$ldi_cat, lw, zero.policy = TRUE)
+# Moran I statistic standard deviate = 19.071, p-value < 2.2e-16 # postive spatial autocorrelation , zipcode with similar LDI alues are sptailly clustered
+# 0.2868497760     -0.0005830904      0.0002271458 
+
+## fit baseline regression model
+ols_model <- lm(ldi_cat ~ index, data = zipcode_fulldata_annual)
+summary(ols_model )
+# index        28.2375     4.3055   6.558 7.24e-11 ***
+# F-statistic: 43.01 on 1 and 1659 DF,  p-value: 7.243e-11
+
+#moran.test(residuals(ols_model), lw, zero.policy = TRUE)
+
+
+## fit spatial lag and error modles
+lag_model <- lagsarlm(ldi_cat ~ index, listw = lw, zero.policy = TRUE, data = zipcode_fulldata_annual)
+summary(lag_model)
+#test value: 4.8415, p-value: 0.027783 # model with spatially lagged dependent variable (LDI in neighborhood); spatial spillover matters, LDI in one ZIP influenced by neighboring ZIPS
+
+error_model <- errorsarlm(ldi_cat ~ index, listw = lw, zero.policy = TRUE, data = na.omit(zipcode_fulldata_annual))
+summary(error_model)
+# Wald statistic: 447.94, p-value: < 2.22e-16
+
+AIC(ols_model, lag_model, error_model)
+# ols_model	3	12606.24		
+# lag_model	4	12317.52		(lowest AIC) spatial interaction is slightly more important than just structured error
+# error_model	4	12319.52	
+
+
+### go with spatial lag
+zipcode_modeldata <- zipcode_fulldata_annual %>%
+  dplyr::filter(!is.na(ldi_cat) & !is.na(index))
+zipcode_fulldata_annual <- zipcode_modeldata # this is dangerous fix later
+nb <- poly2nb(zipcode_fulldata_annual,snap = 0.01)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+lag_model <- lagsarlm(ldi_cat ~ index, listw = lw, zero.policy = TRUE, data = zipcode_fulldata_annual)
+summary(lag_model)
+
+
+
+# a 1 unit increase in index leads to 28.24 unit increase in predicted LDI controlling for sptial dependence
+# rho measures the strength of spatial autorcorelation meaning LDI in one zip is positivelt yinlfluenced by neighboring ZIPS in LDI
+# both index and psatial spillover are important
+# index explains variation in lyme disease risk but the spatial lag effect matters too - suggesting possible regional influences like surveilance, tick migration or reporting norms
+
+## extract and map model predictions
+# add fitted values back to spatial zip
+zipcode_fulldata_annual$ldi_pred <- fitted(lag_model)
+zipcode_fulldata_annual$residuals <- residuals(lag_model)
+
+
+# predicted values 
+ggplot(zipcode_fulldata_annual) +
+  geom_sf(aes(fill = ldi_pred)) +
+  scale_fill_viridis_c(option = "plasma", na.value = "grey90") +
+  theme_minimal() +
+  labs(title = "Predicted Lyme Disease Incidence (Spatial Lag Model)",
+       fill = "Predicted LDI")
+
+# acutal valeus
+ggplot(zipcode_fulldata_annual) +
+  geom_sf(aes(fill = ldi_cat)) +
+  scale_fill_viridis_c(option = "plasma", na.value = "grey90") +
+  theme_minimal() +
+  labs(title = "Observed Lyme Disease Incidence",
+       fill = "Observed LDI")
+
+# map resisduals to check for sptail paterns
+# red = positive --> modled underpredicted LDI here
+# blue = negative --> model overpredicted LDI
+# white good prediciotn (residual ~0)
+# grey NA
+ggplot(zipcode_fulldata_annual) +
+  geom_sf(aes(fill = residuals)) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", na.value = "grey90") +
+  theme_minimal() +
+  labs(title = "Spatial Lag Model Residuals",
+       fill = "Residuals")
+
+ggplot(zipcode_fulldata_annual, aes(x = index, y = ldi_pred)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = FALSE, color = "darkred") +
+  theme_minimal() +
+  labs(title = "Predicted LDI vs Index",
+       x = "Index (Env. Risk × Activity)",
+       y = "Predicted LDI (Spatial Lag)")
+```
+
+make nicer plot of residulas
+```{r}
+
+library(ggplot2)
+library(sf)
+library(ggspatial)
+library(viridis)
+
+ggplot(zipcode_fulldata_annual) +
+  geom_sf(aes(fill = residuals), color = NA) +
+  scale_fill_gradient2(
+    low = "#4575b4",     # blue
+    mid = "white",
+    high = "#d73027",    # red
+    midpoint = 0,
+    na.value = "grey90",
+    name = "Residuals\n(Observed - Predicted)"
+  ) +
+  labs(
+    title = "Residuals from Spatial Lag Model of Lyme Disease Risk",
+    subtitle = "Positive values indicate underprediction; negative indicate overprediction",
+    caption = "Data: CA ZIP codes, Environmental Suitability × Human Activity Index"
+  ) +
+  theme_void(base_size = 11) +
+  theme(
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11),
+    plot.caption = element_text(size = 9, hjust = 0),
+    legend.position = "right",
+    legend.title = element_text(size = 10),
+    legend.text = element_text(size = 9)
+  ) +
+  annotation_scale(location = "bl", width_hint = 0.25) +
+  annotation_north_arrow(location = "bl", which_north = "true",
+                         pad_x = unit(0.2, "in"), pad_y = unit(0.5, "in"),
+                         style = north_arrow_fancy_orienteering)
+
+
+```
+
+```{r}
+ggplot(zipcode_fulldata_annual) +
+  geom_sf(aes(fill = residuals), color = NA) +
+  geom_sf(data = ca_shp, fill = NA, color = "black", size = 0.1) +
+  scale_fill_gradient2(
+    low = "#4575b4", mid = "white", high = "#d73027",
+    limits = c(-10, 10),      
+    midpoint = 0,
+    na.value = "grey90",
+    name = "Residuals\n(Obs - Pred)") +
+  theme_minimal() +
+  labs(title = "Spatial Lag Model Residuals (Clipped to ±2)") +
+  theme(legend.position = "right")
+
+#range(zipcode_fulldata_annual$residuals)
+```
+
+
+Try other methods
+```{r}
+zipcode_fulldata_annual
+
+census_api_key("7c6ef05b5134350077eb61afffdfc0702e3636a4")
+library(tidycensus)
+age_sex_vars <- load_variables(2020, "acs5", cache = TRUE) %>% 
+  filter(str_detect(name, "B01001"))
+race_vars <- load_variables(2020, "acs5", cache = TRUE) %>% 
+  filter(name %in% c("B02001_001", "B02001_002", "B02001_003", "B02001_005", "B02001_006"))  # Total, White, Black, Asian, Other
+
+
+acs_data <- get_acs(
+  geography = "zcta",
+  variables = c(
+    total_pop = "B01001_001",  # Total population
+    male_under_5 = "B01001_003",
+    female_under_5 = "B01001_027",
+    white = "B02001_002",
+    black = "B02001_003",
+    asian = "B02001_005",
+    other = "B02001_006"
+  ),
+  year = 2020,
+  survey = "acs5",
+  #state = "06",
+  output = "wide")
+
+ca_zips <- unique(ca_zipcode_shp$ZIP_CODE)
+acs_data_ca <- acs_data  %>%  filter(GEOID %in% ca_zips)
+
+acs_clean <- acs_data_ca %>%
+  select(GEOID, NAME, total_popE, male_under_5E, female_under_5E, whiteE, blackE, asianE, otherE) %>%
+  rename_with(~ gsub("E$", "", .x))  # Remove 'E' suffix
+
+```
+
+```{r}
+demog <- get_acs(
+  geography = "zcta", 
+  variables = c(
+    # Example: total population, white, black, etc.
+    total_pop = "B01001_001",
+    white = "B02001_002",
+    black = "B02001_003",
+    asian = "B02001_005",
+    other = "B02001_006"
+  ),
+  year = 2020,
+  survey = "acs5",
+  #state = "CA",
+  output = "wide"
+) %>%
+  rename_with(~ gsub("E$", "", .x))
+
+demog <- demog %>%  filter(GEOID %in% ca_zips)
+
+zip_full2 <- zipcode_fulldata_annual %>% rename(GEOID = zip_code) %>% 
+  left_join(demog) %>% 
+    mutate(ldi_case = (ldi_cat/100000)*total_pop)
+
+
+total_cases <- sum(zip_full2$ldi_case, na.rm = TRUE)
+total_pop <- sum(zip_full2$total_pop, na.rm = TRUE)
+
+overall_rate <- total_cases / total_pop
+
+zip_full2 <- zip_full2 %>%
+  mutate(
+    expected = total_pop * overall_rate,
+    SIR = ldi_case / expected
+  )
+
+nb <- poly2nb(zip_full2, snap = 0.01)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+
+model <- errorsarlm(SIR ~ index, listw = lw, data = zip_full2, zero.policy = TRUE)
+summary(model)
+
+zip_full2$SIR <- zip_full2$SIR
+zip_full2$predicted_SIR <- fitted(model)
+zip_full2$resid <- residuals(model)
+
+ggplot(zip_full2) +
+  geom_sf(aes(fill = SIR)) +
+  scale_fill_viridis_c(trans = "sqrt", na.value = "grey90", direction = -1) +
+  labs(title = "Standardized Incidence Ratio (Lyme) by ZIP",
+       fill = "SIR") +
+  theme_minimal()
+```
+
+
+try besag york mollie spatial model
+https://www.thelancet.com/journals/ebiom/article/PIIS2352-3964(25)00145-8/fulltext bayesian modelling framework
+check this out for code in germany https://earth.bsc.es/gitlab/ghr/lyme-germany-2025/-/tree/main/02_analyses
+
+
+```{r}
+zipcode_pop <- get_acs(geography = "zcta",
+               variables = c(total_pop = "B01001_001"),
+               year = 2020, survey = "acs5", output = "wide") %>%
+  rename_with(~ gsub("E$", "", .x))
+
+pop_clean <- zipcode_pop %>% 
+  filter(GEOID %in% ca_zips) %>% 
+  dplyr::select(GEOID, total_pop) %>% 
+  rename(zip_code = GEOID)
+
+
+ca_zipcode_sf <- zipcode_fulldata_annual %>% 
+  left_join(pop_clean, by = "zip_code") %>%
+  mutate(across(everything(), ~replace_na(.x, 0))) %>% 
+  mutate(observed = (ldi_cat/100000) * total_pop)
+
+overall_rate <- sum(ca_zipcode_sf$observed, na.rm = TRUE) / sum(ca_zipcode_sf$total_pop, na.rm = TRUE)
+ca_zipcode_sf <- ca_zipcode_sf %>%
+  mutate(expected = total_pop * overall_rate) %>%
+  mutate(area_id = row_number())
+
+nb <- poly2nb(ca_zipcode_sf, queen = TRUE)
+lw <- nb2listw(nb, style = "B", zero.policy = TRUE)  # Binary weights
+
+# Convert to INLA graph format
+nb2INLA("zip_adj.graph", nb)
+
+# prepare data for inla
+inla_data <- ca_zipcode_sf %>%
+  st_drop_geometry() %>%
+  dplyr::select(area_id, observed, expected, index) %>% 
+  mutate(observed = as.integer(observed))
+
+
+# fit BYM model
+formula <- observed ~ index + f(area_id, model = "bym", graph = "zip_adj.graph")
+library(INLA)
+bym_model <- inla(
+  formula,
+  family = "poisson",
+  data = inla_data,
+  E = expected,  # offset for expected cases
+  control.predictor = list(compute = TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE)
+)
+
+summary(bym_model)
+
+
+# Extract posterior means of RR
+ca_zipcode_sf$RR <- bym_model$summary.fitted.values$mean
+
+# Map
+tmap_mode("plot")
+tm_shape(ca_zipcode_sf) +
+  tm_polygons("RR", palette = "YlOrRd", style = "quantile", title = "Relative Risk") +
+  tm_layout(title = "BYM Model: Lyme Disease Risk", legend.outside = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(sf)
+library(ggplot2)
+library(tidyr)
+
+# 1. Extract fitted values (posterior means of linear predictor)
+zipcode_fulldata_annual$fit_log <- bym_model$summary.linear.predictor$mean
+zipcode_fulldata_annual$fit_risk <- exp(zipcode_fulldata_annual$fit_log)  # on risk scale
+
+# 2. Extract spatial random effects (BYM model separates structured and unstructured, check INLA output)
+# If model used BYM2 parameterization, components might be in:
+bym_model$summary.random$area_id
+
+# Let's extract spatial structured effect posterior means (u_i)
+spatial_effects <- bym_model$summary.random$area_id %>% 
+  filter(ID <= nrow(zipcode_fulldata_annual)) %>%  # Adjust if needed
+  select(ID, mean) %>% 
+  rename(area_id = ID, spatial_effect = mean)
+
+ zipcode_fulldata_annual <- ca_zipcode_sf
+# Join spatial effect back to data
+zipcode_fulldata_annual <- zipcode_fulldata_annual %>% 
+  left_join(spatial_effects, by = "area_id")
+
+# 3. Calculate residuals (observed - fitted counts)
+# If you have observed counts and expected counts:
+zipcode_fulldata_annual$residuals <- zipcode_fulldata_annual$observed - zipcode_fulldata_annual$fit_risk
+
+# 4. Join with shapefile for mapping
+map_data <- ca_zipcode_shp %>% st_make_valid() %>% 
+  st_join(zipcode_fulldata_annual) %>% 
+  st_as_sf()
+
+# 5. Plot fitted risk
+ggplot(map_data) +
+  geom_sf(aes(fill = fit_risk)) +
+  scale_fill_viridis_c(option = "magma", trans = "sqrt", na.value = "grey90") +
+  labs(title = "Fitted Lyme Disease Risk (BYM Model)", fill = "Risk") +
+  theme_minimal()
+
+# 6. Plot spatial random effects
+ggplot(map_data) +
+  geom_sf(aes(fill = spatial_effect)) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, na.value = "grey90") +
+  labs(title = "Spatial Random Effects (Structured) from BYM Model", fill = "Effect") +
+  theme_minimal()
+
+# 7. Plot residuals
+ggplot(map_data) +
+  geom_sf(aes(fill = residuals)) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, na.value = "grey90") +
+  labs(title = "Model Residuals (Observed - Fitted)", fill = "Residual") +
+  theme_minimal()
+
+
+```
+
+maybe run separate parts of index
+
+```{r}
+cor.test(zipcode_fulldata_annual$meta_activity,zipcode_fulldata_annual$tickinf_prob) # -0.1874527 
+
+
+model2 <- errorsarlm(SIR ~  meta_activity + tickinf_prob, listw = lw, data = , zero.policy = TRUE)
+summary(model2)
+
+zip_full2$SIR <- zip_full2$SIR
+zip_full2$predicted_SIR <- fitted(model)
+zip_full2$resid <- residuals(model)
+
+ggplot(zip_full2) +
+  geom_sf(aes(fill = SIR)) +
+  scale_fill_viridis_c(trans = "sqrt", na.value = "grey90", direction = -1) +
+  labs(title = "Standardized Incidence Ratio (Lyme) by ZIP",
+       fill = "SIR") +
+  theme_minimal()
+```
+
+
+from the germany ppl
+
+Model Type:
+Bayesian hierarchical Poisson regression with spatial structure with a BYM2 spatial random effect
+What it does:
+Models the observed count data (cases) assuming a Poisson distribution (typical for count data like disease cases).
+Incorporates an offset E = model_data$total_pop (usually the population or expected cases) to model rates/incidence properly (i.e., controlling for population size).
+Includes a fixed effect covariate index (e.g., a predictor like habitat suitability, human activity, etc.).
+Adds a spatial random effect with the f(zip_num, model = "bym2", graph = g, scale.model = TRUE) term to account for spatial autocorrelation and unmeasured spatial variation.
+
+What is the BYM2 model?
+The BYM2 model is a reparameterization of the Besag-York-Mollié (BYM) spatial model.
+It decomposes spatial variation into two parts:
+Structured spatial effect: captures spatial autocorrelation based on neighboring ZIP codes defined by the graph = g.
+Unstructured random noise: captures non-spatial residual variation.
+BYM2 improves interpretability and identifiability compared to the original BYM.
+
+
+You’re fitting a Bayesian spatial Poisson regression that:
+Predicts the number of disease cases in each ZIP code,
+Adjusts for population size (offset),
+Adjusts for a covariate (index),
+Accounts for spatial correlation among ZIP codes through the BYM2 spatial random effect.
+
+It properly models count data and spatial dependence.
+It gives you smoothed estimates of disease risk (adjusted for population and predictors).
+Helps identify spatial patterns beyond covariates.
+```{r}
+
+# Example: Your ZIP-level data with covariates
+zip_data <- ca_zipcode_sf %>%
+  st_drop_geometry() %>%
+  mutate(across(everything(), ~replace_na(.x, 0))) %>% 
+  mutate(cases = (ldi_cat/100000) * total_pop) %>%
+  select(zip_code, cases, total_pop, index) %>%
+  filter(!is.na(cases) & !is.na(index)) %>% 
+  mutate(cases = as.integer(cases))
+
+# Add numeric ID for spatial indexing
+zip_data <- zip_data %>%
+  arrange(zip_code) %>%
+  mutate(zip_num = as.numeric(factor(zip_code)))
+
+# Filter and arrange ZIP polygons to match data order
+zip_sf <- ca_zipcode_sf %>%
+  filter(zip_code %in% zip_data$zip_code) %>%
+  arrange(match(zip_code, zip_data$zip_code)) %>%
+  mutate(zip_num = as.numeric(factor(zip_code)))
+
+# Create neighbors list
+nb <- spdep::poly2nb(zip_sf, queen = TRUE, snap = 2)
+
+# Check for empty neighbors and handle
+if(any(card(nb) == 0)) {
+  cat("Warning: some ZIPs have no neighbors.\n")
+  # Could use 'zero.policy=TRUE' in INLA or add small buffer to polygons
+}
+
+# Write neighborhood graph for INLA
+nb2INLA("ca_zipcode.graph", nb)
+g <- inla.read.graph("ca_zipcode.graph")
+
+
+model_data <- zip_data %>%
+  arrange(zip_num) %>%
+  mutate(zip_num = zip_num)
+
+formula <- cases ~ index + 
+  f(zip_num, model = "bym2", graph = g, scale.model = TRUE)
+
+#Bayesian hierarchical Poisson regression with spatial structure. using INLA a BYM2 spatial random effect
+result <- inla(
+  formula,
+  family = "poisson",
+  data = model_data,
+  E = model_data$total_pop,  # or expected counts if calculated
+  control.predictor = list(compute = TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE)
+)
+
+summary(result)
+
+
+## plot
+
+
+# Extract fixed effects summary from INLA model
+fixed_effects <- data.frame(
+  term = rownames(result$summary.fixed),
+  mean = result$summary.fixed$mean,
+  lower = result$summary.fixed$`0.025quant`,
+  upper = result$summary.fixed$`0.975quant`
+)
+
+ggplot(fixed_effects %>% filter(term != "(Intercept)"), aes(x = term, y = mean)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2) +
+  labs(title = "Fixed Effects Estimates with 95% Credible Intervals",
+       y = "Estimate (log scale)", x = "") +
+  theme_minimal()
+
+
+library(sf)
+library(dplyr)
+
+# Assuming your spatial data is ca_zipcode_sf and you have an ID matching model$summary.random$zip_num$ID
+spatial_effects <- result$summary.random$zip_num %>%
+  as.data.frame() %>%
+  rename(zip_num = ID) %>%
+  select(zip_num, mean)
+
+# Join spatial effects with spatial dataframe
+ca_zipcode_sf <- ca_zipcode_sf %>%
+  mutate(zip_num = area_id) %>%  # Replace with actual ID column in your sf
+  left_join(spatial_effects, by = "zip_num")
+
+# Plot spatial effect
+ggplot(ca_zipcode_sf) +
+  geom_sf(aes(fill = mean)) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0,
+                       name = "Spatial Effect") +
+  theme_minimal() +
+  labs(title = "Spatial Random Effects from BYM2 Model")
+
+
+# Extract fitted values and observed counts (assuming you have these)
+model_data$fitted <- result$summary.fitted.values$mean
+
+ggplot(model_data, aes(x = fitted, y = cases)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(title = "Fitted vs Observed Counts",
+       x = "Fitted values (posterior mean)",
+       y = "Observed counts") +
+  theme_minimal()
+
+
+df <- data.frame(
+  parameter = c("Precision for zip_num", "Phi for zip_num"),
+  mean = c(0.170, 0.873),
+  lower = c(0.109, 0.602),
+  upper = c(0.253, 0.988)
+)
+
+ggplot(df, aes(x = parameter, y = mean)) +
+  geom_point(size = 3, color = "blue") +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, color = "blue") +
+  labs(title = "95% Credible Intervals for BYM2 Hyperparameters",
+       x = "Parameter",
+       y = "Estimate (mean ± 95% CI)") +
+  theme_minimal()
+
+ggplot(df, aes(x = parameter, y = mean)) +
+  geom_point(size = 3, color = "blue") +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, color = "blue") +
+  labs(title = "95% Credible Intervals for BYM2 Hyperparameters",
+       x = "Parameter",
+       y = "Estimate (mean ± 95% CI)") +
+  theme_minimal()
+
+```
+
+
+this is nice description of disease mappng
+
+https://journals.sagepub.com/doi/full/10.1177/0962280216660421?casa_token=-_kxzjfNRBQAAAAA%3A93-9lTmLdW3dqbL1k7C6MpwtCSyeG2Cjz4x4aelBtc_ljBPWlIhvyeaM2ANRl43h6c89cAENO5f-#bibr1-0962280216660421
+
+The state of the art is to use Bayesian hierarchical models, where the risk surface is modelled using a set of spatial random effects, in addition to potentially available covariate information.1 The random effects shall capture unobserved heterogeneity or spatial correlation that cannot be explained by the available covariates
+
+
+
+
+here's amother example
+geostan
+https://connordonegan.github.io/geostan/
+
+```{r}
+
+
+library(geostan)
+zipcode_tick_shp2 <- ca_zipcode_sf %>% na.omit() %>% st_make_valid() #%>% st_buffer(dist = 0.0001)
+
+nb <- poly2nb(ca_zipcode_sf2, queen = TRUE, snap = 1)
+C <- shape2mat(ca_zipcode_sf2, nb = nb, style = "B")
+
+ca_zipcode_sf2 <- ca_zipcode_sf %>% na.omit()
+mortality_rate <- ca_zipcode_sf2$ldi_cat
+
+
+
+
+no_neighbors <- which(rowSums(C) == 0)
+
+# Remove them from your spatial data and weights matrix
+ca_zipcode_sf_clean <- ca_zipcode_sf2[-no_neighbors, ]
+mortality_rate_clean <- mortality_rate[-no_neighbors]
+C_clean <- C[-no_neighbors, -no_neighbors]
+sp_diag(mortality_rate, ca_zipcode_sf2, w = C_clean, name = "Mortality")
+
+cars <- prep_car_data(C_clean)
+
+fit <- stan_car(ldi_cat ~ offset(log(total_pop)),
+                #censor_point = 9,
+        data = ca_zipcode_sf2,
+        car_parts = cars,
+        family = poisson(),
+        iter = 1e3, # no. MCMC samples
+        quiet = TRUE)
+
+
+
+
+
+
+# Identify ZIPs with no neighbors
+no_neighbors <- which(rowSums(C) == 0)
+
+# Subset everything accordingly
+ca_zipcode_clean <- ca_zipcode_sf2[-no_neighbors, ]
+C_clean <- C[-no_neighbors, -no_neighbors]
+
+# Prepare CAR parts
+cars <- prep_car_data(C_clean)
+
+# Fit the model using the CLEANED dataset
+fit <- stan_car(
+  ldi_cat ~ offset(log(total_pop)),
+  data = ca_zipcode_clean,
+  car_parts = cars,
+  family = poisson(),
+  iter = 1000,
+  quiet = TRUE
+)
+
+
+sp_diag(fit, ca_zipcode_clean)
+print(fit)
+
+mortality_est <- fitted(fit) * 10e3
+
+
+x <- mortality_est$mean
+mortality_est$mean[is.infinite(mortality_est$mean)] <- NA
+mortality_est$mean[is.na(mortality_est$mean)] <- NA
+brks <- quantile(x, probs = c(0, 0.2, 0.4, 0.6, 0.8, 1), na.rm = TRUE) 
+est_cut <- cut(x, breaks = brks, include.lowest = TRUE)
+  
+# assign colors to values
+rank <- as.numeric( est_cut )  
+pal_fun <- colorRampPalette( c("#5D74A5FF", "gray90", "#A8554EFF") )
+max_rank <- max(rank[is.finite(rank)], na.rm = TRUE)
+pal <- pal_fun(max_rank)
+
+colors <-  pal[ rank ]
+
+
+# get boundaries
+geom <- sf::st_geometry(ca_zipcode_clean)
+
+# map  estimates
+plot(geom,
+    lwd = 0.2,
+    col = colors)
+
+# legend
+legend("right",
+     fill = pal,
+     title = 'Mortality per 10,000',
+     legend = levels(est_cut),
+     bty = 'n'
+)
+
+
+# ^ this looks nice 
+
+
+# order counties by mortality rate
+index <- order(mortality_est$mean, decreasing = TRUE)
+dat <- mortality_est[index, ]
+
+# gather estimate with credible interval (95%)
+est <- dat$mean
+lwr <- dat$`2.5%`
+upr <- dat$`97.5%`
+y <- seq_along(est)
+upr[is.infinite(upr)] <- NA
+x_lim <- round(c(min(lwr, na.rm = TRUE), max(upr, na.rm = TRUE)))
+#x_lim <- c(min(lwr), max(upr)) |>round()
+
+og=par(mar = c(3, 0, 0, 0))
+
+# points
+plot(est,
+     y,
+     pch = 5,
+     col = 'gray50',
+     bty = 'L',
+     axes = FALSE,
+     #xlim = x_lim,
+     ylab = NA,
+     xlab = NA)
+
+# intervals
+segments(x0 = lwr, x1 = upr,
+         y0 = y, y1 = y,
+     col = colors[ index ])
+
+# x axis
+axis(1, at = seq(x_lim[1], x_lim[2], by = 20))
+
+
+```
+
+surveil
+```{r}
+install.packages("surveil")
+library(surveil)
+
+
+fit <- stan_rw(data = cancer,
+               time = Year, 
+               group = Age)
+
+fit_apc <- apc(fit)
+plot(fit_apc, cumulative = TRUE)
+
+
+```
+
+
+Bayesian Hierarchical mappings BYM2 (Reparameterized BYM model)
+A more interpretable and better-scaled version of BYM, recommended for modern applications (especially with INLA).
+
+```{r}
+
+library(INLA)
+library(spdep)
+library(sf)
+library(spData)      # contains built-in spatial datasets
+library(ggplot2)
+
+
+nc_sp <- as_Spatial(ca_zipcode_clean) # make spatialpolygondataframe
+
+# create neighborhood structure
+nb <- poly2nb(nc_sp) # list where each element contains the indices of regions that are adjacent (share bondary)
+nb2INLA("nc.adj", nb) # converts list into INLA format, contains adjacency matrix (graph strucutre)
+adjacency <- "nc.adj" # tells INLA how regions are connected (# or regions, each region number of neighbors and IDs)
+
+# check the graph
+plot(nc_sp, border = "grey")
+plot(nb, coordinates(nc_sp), col = "red", add = TRUE)
+
+# simulated code
+nc$E <- runif(nrow(nc), 10, 100)    # expected counts (population offset), using uniform distribution between 10-100
+nc$true_rr <- exp(rnorm(nrow(nc), 0, 0.4))  # true underlying relative risk drawing from normal distrib on log scale and then exponentiation (constrains RR to be positive and fits well with Poisson regression), RR > 1 higher risk than expected
+# if RR = 1.35 35% higher than expected
+nc$Y <- rpois(nrow(nc), lambda = nc$E * nc$true_rr)  # observed counts in each zipcode
+
+# fit BYM2 model
+formula <- Y ~ 1 + f(ID, model = "bym2", graph = adjacency, scale.model = TRUE)
+
+nc$ID <- 1:nrow(nc)  # Area index for random effect
+
+result <- inla(
+  formula,
+  family = "poisson",
+  data = nc,
+  E = E,
+  control.predictor = list(compute = TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE))
+
+# view results
+result$summary.hyperpar # check hyperparameters
+
+# extract posterior mean of RR
+nc$RR_mean <- result$summary.fitted.values$mean
+
+# plot estimated relative risk
+ggplot(nc) +
+  geom_sf(aes(fill = RR_mean)) +
+  scale_fill_viridis_c(option = "C") +
+  labs(title = "Estimated Relative Risk (BYM2)", fill = "RR") +
+  theme_minimal()
+
+```
+transform ldi data into something for BHM
+```{r}
+
+#acs_pop <- get_acs(
+#  geography = "zcta", 
+#  variables = c(total_pop = "B01001_001"),
+#  year = 2020, survey = "acs5", output = "wide") %>%
+#  dplyr::select(GEOID, total_popE) %>% 
+#  rename(total_pop = total_popE)
+#ca_pop <- acs_pop %>%  filter(GEOID %in% ca_zips)
+
+## okay now prepare spatial adjacency for ZIP codes
+ca_zipcode_clean2 <- ca_zipcode_clean %>% dplyr::select(zip_code, po_name, ldi_cat, 
+                                                        meta_activity, tickinf_prob, index,
+                                                        ID)
+
+
+ldi_crs <- st_read("data/raw/LD_incidence/CA_Zips_Lyme_NAD83.shp") %>% 
+  st_transform(st_crs(ca_shp)) %>% 
+  dplyr::select(ZIP_CODE, PO_NAME, LDI_Cat, NAMELSAD)
+
+
+
+ldi_cases <- ldi_crs %>% #st_drop_geometry() %>% 
+  left_join(ca_pop %>% rename(ZIP_CODE = GEOID), by = "ZIP_CODE") %>% 
+  mutate(total_pop = replace_na(total_pop, 0)) %>% 
+  mutate(ldi_totalcases = (LDI_Cat/100000)*total_pop*13,
+         Y = round(ldi_totalcases)) %>% 
+  st_make_valid() 
+
+range(ldi_cases$Y, na.rm = TRUE) #  0 110750
+
+total_Y <- sum(ldi_cases$Y)
+total_pop_years <- sum(ldi_cases$total_pop*13/100000)
+global_rate <- total_Y/total_pop_years
+
+E <- (ldi_cases$total_pop/100000)*13*global_rate
+
+range(E)
+E <- pmax(E, 0.001)
+
+ca_zipcode_clean3 <- ca_zipcode_clean2 %>% 
+  left_join(ldi_cases %>% st_drop_geometry() %>% dplyr::select(ZIP_CODE, Y, ldi_totalcases) %>% rename(zip_code = ZIP_CODE), by = "zip_code")
+
+ca_zipcode_clean3$index_z <- scale(ca_zipcode_clean3$index)
+
+
+
+zip_sp <- as_Spatial(ca_zipcode_clean3) #ca_zipcode_clean2)
+nb <- poly2nb(zip_sp)
+nb2INLA("zip.adj", nb)
+adjacency <- "zip.adj"
+
+# add spatial id
+#ldi_cases$ID <- 1:nrow(ldi_cases)
+
+
+# fit BYM2 model with iNLA
+
+
+formula <- Y ~ index_z + f(ID, model = "bym2", graph = adjacency, scale.model = TRUE)
+result <- inla(formula, family = "poisson", data = ca_zipcode_clean3, 
+               E = E, control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE))
+
+ca_zipcode_clean3$RR <- result$summary.fitted.values$mean
+
+ggplot(ldi_cases) +
+  geom_sf(aes(fill = RR)) +
+  scale_fill_viridis_c(option = "C", direction = -1) +
+  labs(title = "Estimated Relative Risk (LDI - BYM2)", fill = "RR") +
+  theme_minimal()
+```
+
+cleaned up code ^^
+
+this is better but still needs work
+```{r}
+library(tidyverse)
+library(sf)
+library(spdep)
+library(INLA)
+
+# --- 1. Read and prepare LDI shapefile data
+ldi_crs <- st_read("data/raw/LD_incidence/CA_Zips_Lyme_NAD83.shp") %>%
+  st_transform(st_crs(ca_shp)) %>%
+  select(ZIP_CODE, PO_NAME, LDI_Cat, NAMELSAD) 
+
+# --- 2. Join with population data and calculate observed cases (Y)
+ldi_cases <- ldi_crs %>%
+  left_join(ca_pop %>% rename(ZIP_CODE = GEOID), by = "ZIP_CODE") %>%
+  mutate(
+    total_pop = replace_na(total_pop, 0),
+    ldi_totalcases = (LDI_Cat / 100000) * total_pop * 13,
+    Y = round(ldi_totalcases)
+  ) %>%
+  st_make_valid()
+
+# --- 3. Calculate expected counts (E)
+total_Y <- sum(ldi_cases$Y, na.rm = TRUE)
+total_pop_years <- sum(ldi_cases$total_pop * 13 / 100000, na.rm = TRUE)
+global_rate <- total_Y / total_pop_years
+
+E <- (ldi_cases$total_pop / 100000) * 13 * global_rate
+E <- pmax(E, 0.001)  # prevent E = 0
+
+
+# --- 4. Prepare modeling dataset: merge with environmental covariates
+ca_zipcode_clean3 <- ca_zipcode_clean %>%
+  select(zip_code, po_name, ldi_cat, meta_activity, tickinf_prob, index, ID) %>%
+  left_join(
+    ldi_cases %>% 
+      st_drop_geometry() %>%
+      select(ZIP_CODE, Y, ldi_totalcases,total_pop) %>%
+      rename(zip_code = ZIP_CODE),
+    by = "zip_code"
+  ) %>%
+  mutate(index_z = scale(index))
+
+
+## try fixing
+total_Y <- sum(ca_zipcode_clean3$Y, na.rm = TRUE)
+total_pop_years <- sum(ca_zipcode_clean3$total_pop * 13 / 100000, na.rm = TRUE)
+global_rate <- total_Y / total_pop_years
+E <- (ca_zipcode_clean3$total_pop / 100000) * 13 * global_rate
+E <- pmax(E, 0.001)
+
+
+# --- 5. Create adjacency matrix from spatial polygons
+zip_sp <- as_Spatial(ca_zipcode_clean3)
+nb <- poly2nb(zip_sp)
+nb2INLA("zip.adj", nb)
+adjacency <- "zip.adj"
+
+# --- 6. Fit BYM2 spatial model using INLA
+formula <- Y ~ index_z + f(ID, model = "bym2", graph = adjacency, scale.model = TRUE)
+
+result <- inla(
+  formula,
+  family = "poisson",
+  data = ca_zipcode_clean3,
+  E = E,
+  control.predictor = list(compute = TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE)
+)
+
+# --- 7. Add fitted RR (relative risk) to output
+ca_zipcode_clean3$RR <- result$summary.fitted.values$mean
+
+# --- 8. Visualize RR using LDI shapefile
+
+ggplot(ca_zipcode_clean3) +
+  geom_sf(aes(fill = RR), color = NA) +
+  scale_fill_viridis_c(option = "C", direction  = -1) +
+  labs(
+    title = "Estimated Relative Risk (LDI - BYM2)",
+    fill = "RR"
+  ) +
+  theme_minimal()
+
+
+summary(result)$fixed
+exp_beta <- exp(result$summary.fixed["index_z", "mean"])
+result$summary.fitted.values
+ca_zipcode_clean3$RR <- result$summary.fitted.values$mean
+
+ggplot() +
+  geom_sf(data = ca_zipcode_clean3, aes(fill = RR), color = NA) +
+  geom_sf(data = casp_districtdivision_shp2, fill = NA, color = "black") +
+  scale_fill_viridis_c(option = "C", direction = -1) +
+  labs(
+    title = "Estimated Relative Risk (BYM2 Model)",
+    fill = "Relative Risk"
+  ) +
+  theme_void()
+
+## plot covariate effect
+fixed_effect <- result$summary.fixed["index_z", ]
+intercept <- result$summary.fixed["(Intercept)", ]
+
+index_seq <- seq(min(ca_zipcode_clean3$index_z, na.rm = TRUE),
+                 max(ca_zipcode_clean3$index_z, na.rm = TRUE),
+                 length.out = 100)
+
+# Calculate predicted log RR
+log_rr <- intercept["mean"] + fixed_effect["mean"] * index_seq
+rr <- exp(log_rr)
+
+plot(index_seq, rr, type = "l", lwd = 2, col = "blue",
+     xlab = "Scaled Environmental Index (index_z)",
+     ylab = "Predicted Relative Risk",
+     main = "Effect of Environmental Index on Relative Risk")
+
+
+ca_zipcode_clean3$RR_sd <- result$summary.fitted.values$sd
+
+ggplot() +
+  geom_sf(data = casp_districtdivision_shp2, fill = NA, color = "black") +
+  geom_sf(data = ca_zipcode_clean3, aes(fill = RR_sd)) +
+  scale_fill_viridis_c(option = "C", direction = -1) +
+  labs(title = "Uncertainty in Estimated Relative Risk (SD)", fill = "SD") +
+  theme_minimal()
+# After accounting for spatial correlation, areas with a one standard deviation higher environmental index have about 34% higher relative risk of Lyme disease incidence compared to average areas, with 95% credible interval ranging from 9% to 64% increase.
+  casp_districtdivision_shp2 <- casp_districtdivision_shp %>% st_transform(st_crs(ca_shp))
+```
+
+break index down
+```{r}
+ca_zipcode_clean3$meta_activity_z <- scale(ca_zipcode_clean3$meta_activity)
+ca_zipcode_clean3$tickinf_prob_z <- scale(ca_zipcode_clean3$tickinf_prob)
+
+formula <- Y ~ tickinf_prob_z+ meta_activity_z + f(ID, model = "bym2", graph = adjacency, scale.model = TRUE)
+result2 <- inla(formula, family = "poisson", data = ca_zipcode_clean3,
+               E = E,
+               control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE))
+
+beta_env <- result2$summary.fixed["tickinf_prob_z", "mean"]
+beta_hum <- result2$summary.fixed["meta_activity_z", "mean"]
+intercept <- result2$summary.fixed["(Intercept)", "mean"]
+
+human_seq <- seq(-2, 2, length.out = 100)
+
+env_mean <- 0      # mean
+env_low <- -1.5    # low
+env_high <- 1.5    # high
+
+# Calculate predicted log RR (ignoring spatial random effects for visualization):
+log_rr_mean_env <- intercept + beta_env * env_mean + beta_hum * human_seq
+log_rr_low_env  <- intercept + beta_env * env_low  + beta_hum * human_seq
+log_rr_high_env <- intercept + beta_env * env_high + beta_hum * human_seq
+
+rr_mean_env <- exp(log_rr_mean_env)
+rr_low_env  <- exp(log_rr_low_env)
+rr_high_env <- exp(log_rr_high_env)
+
+df_plot <- data.frame(
+  human_activity = rep(human_seq, 3),
+  RR = c(rr_mean_env, rr_low_env, rr_high_env),
+  env_suitability = factor(rep(c("Mean Env", "Low Env", "High Env"), each = length(human_seq)))
+)
+
+ggplot(df_plot, aes(x = human_activity, y = RR, color = env_suitability)) +
+  geom_line(size = 1) +
+  labs(
+    title = "Predicted Relative Risk by Human Activity\nat Different Levels of Environmental Suitability",
+    x = "Human Activity (scaled)",
+    y = "Relative Risk",
+    color = "Environmental Suitability"
+  ) +
+  theme_minimal()
+```
+
+try adding CIs to these plots
+```{r}
+fixed_effects <- result2$summary.fixed  # or result_nb if NB model
+
+intercept_mean <- fixed_effects["(Intercept)", "mean"]
+intercept_sd   <- fixed_effects["(Intercept)", "sd"]
+
+beta_env_mean <- fixed_effects["tickinf_prob_z", "mean"]
+beta_env_sd   <- fixed_effects["tickinf_prob_z", "sd"]
+
+beta_hum_mean <- fixed_effects["meta_activity_z", "mean"]
+beta_hum_sd   <- fixed_effects["meta_activity_z", "sd"]
+
+human_seq <- seq(-4, 4, length.out = 100)
+env_levels <- c(env_low = -1.5, env_mean = 0, env_high = 1.5)
+
+# Prepare a data frame to store results
+library(dplyr)
+df_CI <- data.frame()
+
+for(env_val in env_levels) {
+  mu <- intercept_mean + beta_env_mean * env_val + beta_hum_mean * human_seq
+  var_logRR <- intercept_sd^2 + (env_val^2) * beta_env_sd^2 + (human_seq^2) * beta_hum_sd^2
+  se_logRR <- sqrt(var_logRR)
+  
+  df_temp <- data.frame(
+    human_activity = human_seq,
+    env_suitability = names(env_levels)[env_levels == env_val],
+    RR = exp(mu),
+    RR_lower = exp(mu - 1.96 * se_logRR),
+    RR_upper = exp(mu + 1.96 * se_logRR)
+  )
+  
+  df_CI <- bind_rows(df_CI, df_temp)
+}
+
+# Plot with ribbons for CI
+library(ggplot2)
+ggplot(df_CI, aes(x = human_activity, y = RR, color = env_suitability, fill = env_suitability)) +
+  geom_line(size = 1) +
+  geom_ribbon(aes(ymin = RR_lower, ymax = RR_upper), alpha = 0.3, color = NA) +
+  labs(
+    title = "Predicted Relative Risk by Human Activity\nat Different Levels of Environmental Suitability",
+    x = "Human Activity (scaled)",
+    y = "Relative Risk",
+    color = "Environmental Suitability",
+    fill = "Environmental Suitability"
+  ) +
+  theme_minimal()
+
+
+
+
+```
+BYM2 model
+The main benefit of the BYM2 model is that it allows for an intuitive parameter interpretation and facilitates prior assignment. Performance in terms of model choice criteria is regarded secondary and will be assessed in this section.
+
+Simpson et al.13 proposed a new modification of the commonly known BYM model, termed BYM2 model, which addresses the aforementioned issues, and applied it to one case study. The BYM2 model consists of one precision parameter and one mixing parameter. The precision parameter represents the marginal precision and controls the variability explained by a spatial effect. The mixing parameter distributes existing variability between an unstructured and structured component. Importantly, the structured component is scaled,12 which facilitates prior assignment. PC priors, i.e. principle-based priors, are used to favour simpler models until a more complex model is supported. Furthermore, these priors allow epidemiologically intuitive specification of hyperparameters based on the relative risks.
+
+
+
+okay try getis ord hotspot of monthly tick habitat suitability and monthly human ctivity
+```{r}
+library(sf)
+library(spdep)
+library(tidyverse)
+
+casp_fulldata_monthly_nometa <- st_read("data/processed/casp_fulldata_monthly_nometa.gpkg")
+# tick_monthly_presence flickrgbif_estimatedvisits
+#unique(casp_fulldata_monthly_nometa $district)
+
+casp_fulldata_monthly_bayarea <- casp_fulldata_monthly_nometa %>% 
+  filter(district == "Bay Area District" |
+           district == "Sonoma-Mendocino Coast District") %>% 
+  filter(!is.na(tick_monthly_presence))
+
+# define spatial neighbors
+# distance based neighbors (within 10 km)
+centroids <- st_centroid(casp_fulldata_monthly_bayarea)
+coords <- st_coordinates(centroids)
+nb_dist <- dnearneigh(coords, 0, 1000) # 10 km
+lw_dist <- nb2listw(nb_dist, style = "W")
+
+# run getis ord gi*
+casp_fulldata_monthly_bayarea$Gi_tick <- localG(casp_fulldata_monthly_bayarea$tick_monthly_presence, lw_dist)
+casp_fulldata_monthly_bayarea$Gi_visits <- localG(casp_fulldata_monthly_bayarea$flickrgbif_estimatedvisits, lw_dist)
+casp_fulldata_monthly_bayarea$Gi_index <- localG(casp_fulldata_monthly_bayarea$hotspot_index, lw_dist)
+
+# make numeric 
+casp_fulldata_monthly_bayarea$Gi_tick <- as.numeric(casp_fulldata_monthly_bayarea$Gi_tick)
+casp_fulldata_monthly_bayarea$Gi_visits <- as.numeric(casp_fulldata_monthly_bayarea$Gi_visits)
+casp_fulldata_monthly_bayarea$Gi_index <- as.numeric(casp_fulldata_monthly_bayarea$Gi_index)
+
+## visualize
+ggplot(casp_fulldata_monthly_bayarea) +
+  geom_sf(aes(fill = Gi_index)) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(title = "Getis-Ord Gi* Hotspots: Tick Monthly Presence", fill = "Gi* Z-score") +
+  theme_void()
+
+
+ca_parks_data <- casp_fulldata_monthly_bayarea %>%
+  mutate(
+    Gi_index_sig = case_when(
+      Gi_index >= 1.96 ~ "Hotspot (p<0.05)",
+      Gi_index <= -1.96 ~ "Coldspot (p<0.05)",
+      TRUE ~ "Not significant"
+    )
+  )
+
+ca_parks_data %>% 
+  ggplot() +
+  geom_sf(aes(fill = Gi_index_sig))  +
+  scale_fill_manual(
+    values = c(
+      "Hotspot (p<0.05)" = "red",
+      "Coldspot (p<0.05)" = "blue",
+      "Not significant" = "gray80"
+    )
+  ) +
+  labs(
+    title = "Getis-Ord Gi* Hotspots: Tick Monthly Presence",
+    fill = "Gi* Significance"
+  ) +
+  theme_void()
+```
+
+
+improve index
+```{r}
+casp_fulldata_monthly_nometa <- st_read("data/processed/casp_fulldata_monthly_nometa.gpkg")
+
+
+casp_fulldata_monthly_bayarea <- casp_fulldata_monthly_nometa %>% 
+  filter(district == "Bay Area District" |
+           district == "Sonoma-Mendocino Coast District") %>% 
+  filter(!is.na(tick_monthly_presence))
+
+# define spatial neighbors
+# distance based neighbors (within 10 km)
+casp_fulldata_monthly_bayarea_3310 <- st_transform(casp_fulldata_monthly_bayarea, crs = 3310)
+centroids <- st_centroid(casp_fulldata_monthly_bayarea_3310)
+coords <- st_coordinates(centroids)
+nb_dist <- dnearneigh(coords, 0, 20000) 
+table(card(nb_dist)) 
+lw_dist <- nb2listw(nb_dist, style = "W")
+
+
+nb_dist <- dnearneigh(coords, 0, 50000) 
+ 
+```
+
+try doing k-nearest neighbords
+```{r}
+# Ensure your coords are projected (which they now are)
+knn_nb <- knn2nb(knearneigh(coords, k = 6))  # 6 nearest neighbors per park
+
+# Check neighbor count
+table(card(knn_nb))  # Should all be 6s
+lw_knn <- nb2listw(knn_nb, style = "W")
+
+casp_fulldata_monthly_bayarea_3310$Gi_index <- as.numeric(
+  localG(casp_fulldata_monthly_bayarea_3310$hotspot_index, lw_knn)
+)
+
+bayarea_districts <- casp_districtdivision_shp %>%
+  filter(district %in% c("Bay Area District", "Sonoma-Mendocino Coast District"))
+
+casp_fulldata_monthly_bayarea_3310 %>% 
+  filter(month == 1) %>% 
+ggplot() +
+  geom_sf(data = casp_fulldata_monthly_bayarea_3310 , aes(fill = Gi_index)) +
+  geom_sf(data = bayarea_districts, fill = NA, color = "grey90") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(title = "Getis-Ord Gi* Hotspots: Tick Monthly Presence", fill = "Gi* Z-score") +
+  theme_void() 
+
+casp_fulldata_monthly_bayarea_3310 %>% 
+  filter(month == 6) %>% 
+ggplot() +
+  geom_sf(data = casp_fulldata_monthly_bayarea_3310 , aes(fill = Gi_index)) +
+  geom_sf(data = bayarea_districts, fill = NA, color = "grey90") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  labs(title = "Getis-Ord Gi* Hotspots: Tick Monthly Presence", fill = "Gi* Z-score") +
+  theme_void() 
+  
+```
+try for each month
+```{r}
+
+library(dplyr)
+library(spdep)
+library(sf)
+
+# Assuming your data has a `month` column and already projected with coords
+centroids <- st_centroid(casp_fulldata_monthly_bayarea_3310)
+coords <- st_coordinates(centroids)
+
+# Build neighbors once (e.g., k-nearest neighbors with k=6)
+knn_nb <- knn2nb(knearneigh(coords, k = 6))
+lw_knn <- nb2listw(knn_nb, style = "W")
+
+# Calculate Gi* for each month and combine results
+gi_by_month <- casp_fulldata_monthly_bayarea_3310 %>%
+  group_by(month) %>%
+  group_modify(~ {
+    df <- .x
+    # Calculate Gi* on hotspot_index or your variable of interest
+    Gi_values <- localG(df$hotspot_index, lw_knn)
+    df$Gi_index <- as.numeric(Gi_values)
+    df
+  }) %>%
+  ungroup()
+gi_by_month <- gi_by_month %>%
+  mutate(
+    Gi_index_sig = case_when(
+      Gi_index >= 1.96 ~ "Hotspot (p < 0.05)",
+      Gi_index <= -1.96 ~ "Coldspot (p < 0.05)",
+      TRUE ~ "Not significant"
+    )
+  )
+
+library(ggplot2)
+
+ggplot(gi_by_month) +
+  geom_sf(aes(fill = Gi_index_sig)) +
+  scale_fill_manual(values = c(
+    "Hotspot (p < 0.05)" = "red",
+    "Coldspot (p < 0.05)" = "blue",
+    "Not significant" = "gray80"
+  )) +
+  facet_wrap(~ month) +
+  labs(title = "Monthly Getis-Ord Gi* Hotspots: Tick Spatial Risk",
+       fill = "Gi* Significance") +
+  theme_void()
+
+
+## annimate 
+library(gganimate)
+
+ggplot(gi_by_month) +
+  geom_sf(aes(fill = Gi_index_sig)) +
+  scale_fill_manual(values = c(
+    "Hotspot (p < 0.05)" = "red",
+    "Coldspot (p < 0.05)" = "blue",
+    "Not significant" = "gray80"
+  )) +
+  labs(title = "Getis-Ord Gi* Hotspots: Month {frame_time}",
+       fill = "Gi* Significance") +
+  theme_void() +
+  transition_time(month) +
+  ease_aes('linear')
+
+
+```
+
+
+```{r}
+centroids <- st_centroid(casp_fulldata_monthly_bayarea_3310 %>% distinct(UNITNAME, .keep_all = TRUE))
+coords <- st_coordinates(centroids)
+knn_nb <- knn2nb(knearneigh(coords, k = 6))
+lw_knn <- nb2listw(knn_nb, style = "W")
+
+
+library(tidyr)
+
+
+hotspot_wide <- casp_fulldata_monthly_bayarea_3310 %>%
+  dplyr::select(UNITNAME, month, hotspot_index) %>%
+  pivot_wider(names_from = month, values_from = hotspot_index)
+
+Gi_results <- hotspot_wide %>%
+  mutate(across(where(is.numeric), ~ as.numeric(localG(.x, lw_knn))))
+
+Gi_results <- Gi_results %>%
+  select(UNITNAME, everything())
+
+
+Gi_long <- Gi_results %>%
+  st_set_geometry(NULL) %>% 
+  pivot_longer(-UNITNAME, names_to = "month", values_to = "Gi_index") %>%
+  left_join(casp_fulldata_monthly_bayarea_3310 %>% dplyr::select(UNITNAME) %>% distinct(), by = "UNITNAME") %>%
+  st_as_sf()
+
+
+Gi_long <- Gi_long %>%
+  mutate(
+    Gi_index_sig = case_when(
+      Gi_index >= 1.96 ~ "Hotspot (p < 0.05)",
+      Gi_index <= -1.96 ~ "Coldspot (p < 0.05)",
+      TRUE ~ "Not significant"
+    )
+  )
+
+bayarea_districts <- casp_districtdivision_shp %>%
+  filter(district %in% c("Bay Area District", "Sonoma-Mendocino Coast District"))
+
+Gi_long %>% 
+  filter(month == 1) %>% 
+ggplot() +
+  geom_sf(aes(fill = Gi_index_sig)) +
+  geom_sf(data = bayarea_districts, fill = NA, color = "grey90") +
+  #facet_wrap(~ month) +
+  scale_fill_manual(values = c("Hotspot (p < 0.05)" = "red", "Coldspot (p < 0.05)" = "blue", "Not significant" = "gray80")) +
+  theme_void() +
+  labs(title = "Getis-Ord Gi* Hotspots by Month")
+
+Gi_long %>% 
+  filter(month == 2) %>% 
+ggplot() +
+  geom_sf(aes(fill = Gi_index_sig)) +
+  geom_sf(data = bayarea_districts, fill = NA, color = "grey90") +
+  #facet_wrap(~ month) +
+  scale_fill_manual(values = c("Hotspot (p < 0.05)" = "red", "Coldspot (p < 0.05)" = "blue", "Not significant" = "gray80")) +
+  theme_void() +
+  labs(title = "Getis-Ord Gi* Hotspots by Month")
+
+
+Gi_long %>% 
+  filter(month == 3) %>% 
+ggplot() +
+  geom_sf(aes(fill = Gi_index_sig)) +
+  geom_sf(data = bayarea_districts, fill = NA, color = "grey90") +
+  #facet_wrap(~ month) +
+  scale_fill_manual(values = c("Hotspot (p < 0.05)" = "red", "Coldspot (p < 0.05)" = "blue", "Not significant" = "gray80")) +
+  theme_void() +
+  labs(title = "Getis-Ord Gi* Hotspots by Month")
+
+Gi_long %>% 
+  filter(month == 4) %>% 
+ggplot() +
+  geom_sf(aes(fill = Gi_index_sig)) +
+  geom_sf(data = bayarea_districts, fill = NA, color = "grey90") +
+  #facet_wrap(~ month) +
+  scale_fill_manual(values = c("Hotspot (p < 0.05)" = "red", "Coldspot (p < 0.05)" = "blue", "Not significant" = "gray80")) +
+  theme_void() +
+  labs(title = "Getis-Ord Gi* Hotspots by Month")
+
+
+Gi_long %>% 
+  filter(month == 5) %>% 
+ggplot() +
+  geom_sf(aes(fill = Gi_index_sig)) +
+  geom_sf(data = bayarea_districts, fill = NA, color = "grey90") +
+  #facet_wrap(~ month) +
+  scale_fill_manual(values = c("Hotspot (p < 0.05)" = "red", "Coldspot (p < 0.05)" = "blue", "Not significant" = "gray80")) +
+  theme_void() +
+  labs(title = "Getis-Ord Gi* Hotspots by Month")
+
+Gi_long %>% 
+  filter(month == 6) %>% 
+ggplot() +
+  geom_sf(aes(fill = Gi_index_sig)) +
+  geom_sf(data = bayarea_districts, fill = NA, color = "grey90") +
+  #facet_wrap(~ month) +
+  scale_fill_manual(values = c("Hotspot (p < 0.05)" = "red", "Coldspot (p < 0.05)" = "blue", "Not significant" = "gray80")) +
+  theme_void() +
+  labs(title = "Getis-Ord Gi* Hotspots by Month")
+
+
+Gi_long %>% 
+  filter(month == 7) %>% 
+ggplot() +
+  geom_sf(aes(fill = Gi_index_sig)) +
+  geom_sf(data = bayarea_districts, fill = NA, color = "grey90") +
+  #facet_wrap(~ month) +
+  scale_fill_manual(values = c("Hotspot (p < 0.05)" = "red", "Coldspot (p < 0.05)" = "blue", "Not significant" = "gray80")) +
+  theme_void() +
+  labs(title = "Getis-Ord Gi* Hotspots by Month")
+
+Gi_long %>% 
+  filter(month == 8) %>% 
+ggplot() +
+  geom_sf(aes(fill = Gi_index_sig)) +
+  geom_sf(data = bayarea_districts, fill = NA, color = "grey90") +
+  #facet_wrap(~ month) +
+  scale_fill_manual(values = c("Hotspot (p < 0.05)" = "red", "Coldspot (p < 0.05)" = "blue", "Not significant" = "gray80")) +
+  theme_void() +
+  labs(title = "Getis-Ord Gi* Hotspots by Month")
+
+
+Gi_long %>% 
+  filter(month == 9) %>% 
+ggplot() +
+  geom_sf(aes(fill = Gi_index_sig)) +
+  geom_sf(data = bayarea_districts, fill = NA, color = "grey90") +
+  #facet_wrap(~ month) +
+  scale_fill_manual(values = c("Hotspot (p < 0.05)" = "red", "Coldspot (p < 0.05)" = "blue", "Not significant" = "gray80")) +
+  theme_void() +
+  labs(title = "Getis-Ord Gi* Hotspots by Month")
+
+
+Gi_long %>% 
+  filter(month == 10) %>% 
+ggplot() +
+  geom_sf(aes(fill = Gi_index_sig)) +
+  geom_sf(data = bayarea_districts, fill = NA, color = "grey90") +
+  #facet_wrap(~ month) +
+  scale_fill_manual(values = c("Hotspot (p < 0.05)" = "red", "Coldspot (p < 0.05)" = "blue", "Not significant" = "gray80")) +
+  theme_void() +
+  labs(title = "Getis-Ord Gi* Hotspots by Month")
+
+Gi_long %>% 
+  filter(month == 11) %>% 
+ggplot() +
+  geom_sf(aes(fill = Gi_index_sig)) +
+  geom_sf(data = bayarea_districts, fill = NA, color = "grey90") +
+  #facet_wrap(~ month) +
+  scale_fill_manual(values = c("Hotspot (p < 0.05)" = "red", "Coldspot (p < 0.05)" = "blue", "Not significant" = "gray80")) +
+  theme_void() +
+  labs(title = "Getis-Ord Gi* Hotspots by Month")
+
+
+library(gganimate)
+Gi_long %>% 
+  mutate(month = as.numeric(month)) %>% 
+ggplot() +
+  geom_sf(aes(fill = Gi_index_sig)) +
+  scale_fill_manual(values = c("Hotspot (p < 0.05)" = "red", "Coldspot (p < 0.05)" = "blue", "Not significant" = "gray80")) +
+  labs(title = 'Month: {frame_time}') +
+  transition_time(month) +
+  ease_aes('linear')
+
+ggplot(Gi_long) +
+  geom_sf(aes(fill = Gi_index_sig)) +
+  facet_wrap(~ month) +
+    scale_fill_manual(values = c("Hotspot (p < 0.05)" = "red", "Coldspot (p < 0.05)" = "blue", "Not significant" = "gray80")) +
+theme_void()
+
+Gi_long %>%
+  group_by(month, Gi_index_sig) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = month, y = count, fill = Gi_index_sig)) +
+  geom_col(position = "stack") +
+  labs(title = "Number of Hotspots/Coldspots Over Time")
+```
+
+
+
+fiddle around with knn
+```{r}
+
+library(spdep)
+library(INLA)
+
+parks_unique <- casp_fulldata_monthly_bayarea_3310 %>%
+  distinct(UNITNAME, .keep_all = TRUE) %>%
+  st_as_sf()  # ensure it's sf
+
+# Now get coords in same order as parks_unique
+coords <- st_coordinates(st_centroid(parks_unique))
+
+# Suppose you have park centroids coords already
+
+
+knn_nb <- knn2nb(knearneigh(coords, k=7))
+names(knn_nb) <- parks_unique$UNITNAME
+park_ids <- data.frame(UNITNAME = names(knn_nb), park_id = seq_along(knn_nb))
+
+lw_knn <- nb2listw(knn_nb, style = "B")  # binary style adjacency for INLA
+
+# Write graph in INLA format
+nb2INLA("park_adj.graph", knn_nb)
+
+
+# Create numeric IDs for parks (match order of adjacency)
+park_ids <- data.frame(UNITNAME = names(knn_nb), park_id = 1:length(knn_nb))
+
+df <- casp_fulldata_monthly_bayarea_3310 %>%
+  left_join(park_ids, by = "UNITNAME") %>%
+  mutate(month_num = as.numeric(as.factor(month)))
+
+
+formula <- hotspot_index ~ 1 +
+  f(park_id, model = "bym2", graph = "park_adj.graph") + 
+  f(month_num, model = "rw1")
+
+formula <- hotspot_index ~ 1 +
+  f(park_id, model = "bym2", graph = "park_adj.graph") + 
+  f(month_num, model = "rw1") 
+
+
+result <- inla(
+  formula,
+  data = df,
+  family = "gaussian",
+  control.predictor = list(compute = TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE)
+)
+
+spatial_effects <- result$summary.random$park_id
+temporal_effects <- result$summary.random$month_num
+
+
+df <- df %>%
+  arrange(park_id, month_num) %>%
+  mutate(interaction_id = as.numeric(factor(paste(park_id, month_num, sep = "_"))))
+
+
+
+```
+
+
+
+```{r}
+bayarea_districts2 <- bayarea_districts %>% st_transform(st_crs(ca_shp))
+
+casp_fulldata_monthly_bayarea_3310 %>% st_transform(st_crs(ca_shp)) %>%
+  filter(month == 1) %>% 
+  group_by(UNITNAME, month) %>% 
+  summarise(hotspot_index= mean(hotspot_index, na.rm = TRUE)) %>% 
+ggplot() +
+  geom_sf(data = casp_fulldata_monthly_bayarea_3310 , aes(fill = hotspot_index )) +
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_fill_viridis_c( direction = -1) +
+  theme_void()
+
+casp_fulldata_monthly_bayarea_3310 %>% st_transform(st_crs(ca_shp)) %>% 
+  filter(month == 2) %>% 
+  group_by(UNITNAME, month) %>% 
+  summarise(hotspot_index= mean(hotspot_index, na.rm = TRUE)) %>% 
+ggplot() +
+  geom_sf(data = casp_fulldata_monthly_bayarea_3310 , aes(fill = hotspot_index )) +
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_fill_viridis_c( direction = -1) +
+  theme_void()
+
+casp_fulldata_monthly_bayarea_3310 %>% st_transform(st_crs(ca_shp)) %>% 
+  filter(month == 3) %>% 
+  group_by(UNITNAME, month) %>% 
+  summarise(hotspot_index= mean(hotspot_index, na.rm = TRUE), drop = ".groups") %>% 
+ggplot() +
+  geom_sf(data = casp_fulldata_monthly_bayarea_3310 , aes(fill = log(hotspot_index+1) )) +
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_fill_viridis_c( direction = -1) +
+  theme_void()
+
+casp_fulldata_monthly_bayarea_3310 %>% st_transform(st_crs(ca_shp)) %>% 
+  filter(month == 4) %>% 
+  group_by(UNITNAME, month) %>% 
+  summarise(hotspot_index= mean(hotspot_index, na.rm = TRUE), drop = ".groups") %>% 
+ggplot() +
+  geom_sf(data = casp_fulldata_monthly_bayarea_3310 , aes(fill = log(hotspot_index+1) )) +
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_fill_viridis_c( direction = -1) +
+  theme_void()
+
+casp_fulldata_monthly_bayarea_3310 %>% st_transform(st_crs(ca_shp)) %>% 
+  filter(month == 5) %>% 
+  group_by(UNITNAME, month) %>% 
+  summarise(hotspot_index= mean(hotspot_index, na.rm = TRUE), drop = ".groups") %>% 
+ggplot() +
+  geom_sf(data = casp_fulldata_monthly_bayarea_3310 , aes(fill = log(hotspot_index+1) )) +
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_fill_viridis_c( direction = -1) +
+  theme_void()
+
+```
+
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(sf)
+
+# First, summarize hotspot_index by park and month
+summary_df <- casp_fulldata_monthly_bayarea_3310 %>%
+  st_transform(st_crs(ca_shp)) %>%    # Transform CRS
+  group_by(UNITNAME, month) %>%
+  summarise(hotspot_index = mean(hotspot_index, na.rm = TRUE), .groups = "drop") %>%
+  left_join(
+    casp_fulldata_monthly_bayarea_3310 %>%
+      st_transform(st_crs(ca_shp)) %>%
+      distinct(UNITNAME), 
+    by = "UNITNAME"
+  ) %>%
+  st_as_sf()
+
+# Now plot with facets for months
+ggplot(summary_df) +
+  geom_sf(aes(fill = log(hotspot_index + 1))) +
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_fill_viridis_c(direction = -1, name = "Log Hotspot Index") +
+  facet_wrap(~ month, ncol = 3) +
+  theme_void() +
+  labs(title = "Monthly Hotspot Index per Park") +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(size = 12))
+
+
+
+summary_df %>% 
+  filter(month == 1) %>% 
+ggplot() +
+  geom_sf(aes(fill = hotspot_index)) +
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_fill_viridis_c(direction = -1, name = "Log Hotspot Index") +
+  #facet_wrap(~ month, ncol = 3) +
+  theme_void() +
+  labs(title = "Monthly Hotspot Index per Park") +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(size = 12))
+
+
+summary_df %>% 
+  filter(month == 2) %>% 
+ggplot() +
+  geom_sf(aes(fill = hotspot_index)) +
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_fill_viridis_c(direction = -1, name = "Log Hotspot Index") +
+  #facet_wrap(~ month, ncol = 3) +
+  theme_void() +
+  labs(title = "Monthly Hotspot Index per Park") +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(size = 12))
+
+
+
+
+# Filter for month 1 only, and explicitly convert to sf again
+month1_sf <- summary_df %>% 
+  filter(month == 1) %>%
+  st_as_sf()
+
+# Check number of rows and unique geometries
+print(nrow(month1_sf))
+#print(length(unique(st_as_text(month1_sf$geometry))))
+
+# Plot
+ggplot(month1_sf) +
+  geom_sf(aes(fill = hotspot_index)) +
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_fill_viridis_c(direction = -1, name = "Hotspot Index") +
+  theme_void() +
+  labs(title = "Month 1 Hotspot Index per Park")
+
+
+month2_sf <- summary_df %>% 
+  filter(month == 2) %>%
+  st_as_sf()
+
+ggplot(month2_sf) + 
+  geom_sf(aes(color = log(hotspot_index+1)), size = 3) + 
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") + 
+  scale_fill_viridis_c(direction = -1, name = "Hotspot Index") + 
+  theme_void() + 
+  labs(title = "Month 2 Hotspot Index per Park")
+
+
+month4_sf <- summary_df %>% 
+  filter(month == 4) %>%
+  st_as_sf()
+
+ggplot(month4_sf) + 
+  geom_sf(aes(color = log(hotspot_index+1)), size = 3) + 
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") + 
+  scale_fill_viridis_c(direction = -1, name = "Hotspot Index") + 
+  theme_void() + 
+  labs(title = "Month 2 Hotspot Index per Park")
+
+
+month6_sf <- summary_df %>% 
+  filter(month == 6) %>%
+  st_as_sf()
+
+ggplot(month6_sf) + 
+  geom_sf(aes(color = log(hotspot_index+1)), size = 3) + 
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") + 
+  scale_fill_viridis_c(direction = -1, name = "Hotspot Index") + 
+  theme_void() + 
+  labs(title = "Month 2 Hotspot Index per Park")
+
+
+
+
+
+# Extract geometry from centroids
+centroid_geom <- park_centroids %>% select(UNITNAME, geom)
+
+# Join summary_df with centroid geometry (keeping geometry separate)
+summary_with_centroids <- summary_df %>%
+  left_join(st_drop_geometry(centroid_geom), by = "UNITNAME") %>%
+  st_join(centroid_geom, by = "UNITNAME") %>%
+  st_as_sf()
+
+# Filter for month 1
+month1_points <- summary_with_centroids %>%
+  filter(month == 1)
+
+# Plot points
+ggplot(month1_points) +
+  geom_sf(aes(color = hotspot_index), size = 3) +
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_color_viridis_c(direction = -1, name = "Hotspot Index") +
+  theme_void() +
+  labs(title = "Month 1 Hotspot Index (Centroids)")
+
+
+```
+
+```{r}
+park_centroids <- casp_fulldata_monthly_bayarea %>%
+  distinct(UNITNAME, .keep_all = TRUE) %>%
+  st_transform(st_crs(ca_shp)) %>%
+  st_centroid()  # geometry is kept automatically
+
+# If you want to explicitly keep only UNITNAME and geometry, do:
+park_centroids <- park_centroids %>%
+  select(UNITNAME)
+
+# Drop geometry from park_centroids for attribute join
+park_centroids_attr <- st_drop_geometry(park_centroids)
+
+# Join summary data with centroid attributes
+summary_points <- summary_df %>%
+  left_join(park_centroids_attr, by = "UNITNAME")
+
+# Now add geometry from park_centroids based on UNITNAME
+
+# Convert to sf, specifying the geometry column
+summary_points <- st_as_sf(summary_points, sf_column_name = "geometry", crs = st_crs(park_centroids))
+
+
+summary_points %>% 
+  filter(month == 1) %>% 
+ggplot() +
+  geom_sf(aes(color = hotspot_index), size = 3) +
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_color_viridis_c(direction = -1, option = "C", name = "Hotspot Index") +
+  facet_wrap(~ month) +
+  theme_void() +
+  labs(title = "Monthly Hotspot Index per Park (Centroids)")
+
+
+```
+
+
+```{r}
+park_centroids <- casp_fulldata_monthly_bayarea %>%
+  distinct(UNITNAME, .keep_all = TRUE) %>%
+  st_transform(st_crs(ca_shp)) %>%
+  st_centroid()  # geometry is kept automatically
+
+# If you want to explicitly keep only UNITNAME and geometry, do:
+park_centroids <- park_centroids %>%
+  select(UNITNAME)
+
+# Drop geometry from park_centroids for attribute join
+park_centroids_attr <- st_drop_geometry(park_centroids)
+summary_points <- summary_df %>%
+  left_join(park_centroids_attr, by = "UNITNAME")
+
+summary_points <- st_as_sf(summary_points, sf_column_name = "geometry", crs = st_crs(park_centroids))
+
+
+summary_points %>% st_centroid() %>% filter(month == 1) %>% 
+ggplot() +
+  geom_sf(aes(color = hotspot_index), size = 3) +  # points from centroid geometry
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_color_viridis_c(direction = -1, option = "C", name = "Hotspot Index") +
+  theme_void() +
+  labs(title = "Month 1 Hotspot Index per Park (Centroids)")
+
+
+summary_points %>% st_centroid() %>% filter(month == 2) %>% 
+ggplot() +
+  geom_sf(aes(color = hotspot_index), size = 3) +  # points from centroid geometry
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_color_viridis_c(direction = -1, option = "C", name = "Hotspot Index") +
+  theme_void() +
+  labs(title = "Month 1 Hotspot Index per Park (Centroids)")
+
+
+summary_points %>% st_centroid() %>% filter(month == 3) %>% 
+ggplot() +
+  geom_sf(aes(color = hotspot_index), size = 3) +  # points from centroid geometry
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_color_viridis_c(direction = -1, option = "C", name = "Hotspot Index") +
+  theme_void() +
+  labs(title = "Month 1 Hotspot Index per Park (Centroids)")
+
+summary_points %>% st_centroid() %>% filter(month == 4) %>% 
+ggplot() +
+  geom_sf(aes(color = hotspot_index), size = 3) +  # points from centroid geometry
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_color_viridis_c(direction = -1, option = "C", name = "Hotspot Index") +
+  theme_void() +
+  labs(title = "Month 1 Hotspot Index per Park (Centroids)")
+
+
+```
+
+try making scale similar - okay this is best i got so far
+```{r}
+
+range(log(summary_points$hotspot_index+1), na.rm = TRUE) #0 273015 or 0.00000, 12.51729
+
+
+summary_points %>% st_centroid() %>% filter(month == 1) %>% 
+ggplot() +
+  geom_sf(aes(color = log(hotspot_index+1)), size = 3) +  # points from centroid geometry
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_color_viridis_c(direction = -1, option = "C", name = "Hotspot Index",
+                        limits = c(0.00000, 12.51729), na.value = "grey90" ) +
+  theme_void() +
+  labs(title = "Month 1 Hotspot Index per Park (Centroids)")
+
+summary_points %>% st_centroid() %>% filter(month == 2) %>% 
+ggplot() +
+  geom_sf(aes(color = log(hotspot_index+1)), size = 3) +  # points from centroid geometry
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_color_viridis_c(direction = -1, option = "C", name = "Hotspot Index",
+                        limits = c(0.00000, 12.51729), na.value = "grey90" ) +
+  theme_void() +
+  labs(title = "Month 1 Hotspot Index per Park (Centroids)")
+
+
+summary_points %>% st_centroid() %>% filter(month == 3) %>% 
+ggplot() +
+  geom_sf(aes(color = log(hotspot_index+1)), size = 3) +  # points from centroid geometry
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_color_viridis_c(direction = -1, option = "C", name = "Hotspot Index",
+                        limits = c(0.00000, 12.51729), na.value = "grey90" ) +
+  theme_void() +
+  labs(title = "Month 1 Hotspot Index per Park (Centroids)")
+
+
+summary_points %>% st_centroid() %>% filter(month == 4) %>% 
+ggplot() +
+  geom_sf(aes(color = log(hotspot_index+1)), size = 3) +  # points from centroid geometry
+  geom_sf(data = bayarea_districts2, fill = NA, color = "grey90") +
+  scale_color_viridis_c(direction = -1, option = "C", name = "Hotspot Index",
+                        limits = c(0.00000, 12.51729), na.value = "grey90" ) +
+  theme_void() +
+  labs(title = "Month 1 Hotspot Index per Park (Centroids)")
+
+```
+try for other districts
+```{r}
+
+park_centroids <- casp_fulldata_monthly_nometa %>% st_make_valid() %>% 
+  distinct(UNITNAME, .keep_all = TRUE) %>%
+  st_transform(st_crs(ca_shp)) %>%
+  st_centroid()  # geometry is kept automatically
+
+# If you want to explicitly keep only UNITNAME and geometry, do:
+park_centroids <- park_centroids %>%
+  select(UNITNAME)
+
+# Drop geometry from park_centroids for attribute join
+park_centroids_attr <- st_drop_geometry(park_centroids)
+
+summary_df <- casp_fulldata_monthly_nometa %>% st_make_valid() %>% 
+  st_transform(st_crs(ca_shp)) %>%    # Transform CRS
+  group_by(UNITNAME, month) %>%
+  summarise(hotspot_index = mean(hotspot_index, na.rm = TRUE), .groups = "drop") %>%
+  left_join(
+    casp_fulldata_monthly_bayarea_3310 %>%
+      st_transform(st_crs(ca_shp)) %>%
+      distinct(UNITNAME), 
+    by = "UNITNAME"
+  ) %>%
+  st_as_sf()
+
+
+# Join summary data with centroid attributes
+summary_points <- summary_df %>%
+  left_join(park_centroids_attr, by = "UNITNAME")
+
+# Now add geometry from park_centroids based on UNITNAME
+
+# Convert to sf, specifying the geometry column
+summary_points <- st_as_sf(summary_points, sf_column_name = "geometry", crs = st_crs(park_centroids))
+
+
+summary_points %>% st_centroid() %>% filter(month == 1) %>% 
+ggplot() +
+  geom_sf(aes(color = log(hotspot_index+1)), size = 3) +  # points from centroid geometry
+  geom_sf(data = ca_shp, fill = NA, color = "grey90") +
+  scale_color_viridis_c(direction = -1, option = "C", name = "Hotspot Index",
+                        limits = c(0.00000, 12.51729), na.value = "grey90" ) +
+  theme_void() +
+  labs(title = "Month 1 Hotspot Index per Park (Centroids)")
+
+summary_points %>% st_centroid() %>% filter(month == 3) %>% 
+ggplot() +
+  geom_sf(aes(color = log(hotspot_index+1)), size = 3) +  # points from centroid geometry
+  geom_sf(data = ca_shp, fill = NA, color = "grey90") +
+  scale_color_viridis_c(direction = -1, option = "C", name = "Hotspot Index",
+                        limits = c(0.00000, 12.51729), na.value = "grey90" ) +
+  theme_void() +
+  labs(title = "Month 1 Hotspot Index per Park (Centroids)")
+
+summary_points %>% st_centroid() %>% filter(month == 5) %>% 
+ggplot() +
+  geom_sf(aes(color = log(hotspot_index+1)), size = 3) +  # points from centroid geometry
+  geom_sf(data = ca_shp, fill = NA, color = "grey90") +
+  scale_color_viridis_c(direction = -1, option = "C", name = "Hotspot Index",
+                        limits = c(0.00000, 12.51729), na.value = "grey90" ) +
+  theme_void() +
+  labs(title = "Month 1 Hotspot Index per Park (Centroids)")
+
+summary_points %>% st_centroid() %>% filter(month == 7) %>% 
+ggplot() +
+  geom_sf(aes(color = log(hotspot_index+1)), size = 3) +  # points from centroid geometry
+  geom_sf(data = ca_shp, fill = NA, color = "grey90") +
+  scale_color_viridis_c(direction = -1, option = "C", name = "Hotspot Index",
+                        limits = c(0.00000, 12.51729), na.value = "grey90" ) +
+  theme_void() +
+  labs(title = "Month 1 Hotspot Index per Park (Centroids)")
+
+summary_points %>% st_centroid() %>% filter(month == 9) %>% 
+ggplot() +
+  geom_sf(aes(color = log(hotspot_index+1)), size = 3) +  # points from centroid geometry
+  geom_sf(data = ca_shp, fill = NA, color = "grey90") +
+  scale_color_viridis_c(direction = -1, option = "C", name = "Hotspot Index",
+                        limits = c(0.00000, 12.51729), na.value = "grey90" ) +
+  theme_void() +
+  labs(title = "Month 1 Hotspot Index per Park (Centroids)")
+
+
+```
+
+
+other ways 
+```{r}
+manova_test <- manova(cbind(tick_monthly_presence, flickrgbif_estimatedvisits) ~ month, data = casp_fulldata_monthly_nometa)
+summary(manova_test)
+summary.aov(manova_test)
+#month          1  20.864 20.8641  257.82 < 2.2e-16 *** (tick)
+# human month          1 2.6865e+09 2686473919  0.8034 0.3702
+
+pairwise.wilcox.test(casp_fulldata_monthly_nometa$tick_monthly_presence,
+                     casp_fulldata_monthly_nometa$month, 
+                     p.adjust.method = "BH")
+
+ggplot(casp_fulldata_monthly_nometa, aes(x = factor(month), y = tick_monthly_presence)) +
+  geom_boxplot() +
+  labs(title = "Tick Presence by Month")
+
+## gam
+library(mgcv)
+gam_tick <- gam(tick_monthly_presence ~ s(month, k = 12), 
+                data = casp_fulldata_monthly_nometa, 
+                family = gaussian())  # Or use `poisson()` if count data
+
+gam_visits <- gam(flickrgbif_estimatedvisits ~ s(month, k = 12), 
+                  data = casp_fulldata_monthly_nometa, 
+                  family = gaussian())
+plot(gam_tick, shade = TRUE, main = "Tick Presence by Month")
+plot(gam_visits, shade = TRUE, main = "Human Visits by Month")
+
+library(gratia)
+draw(gam_tick)
+draw(gam_visits)
+
+## try annual gam
+
+                
+             
+mod <- gam(ldi_cat ~ s(tickinf_prob,meta_activity),
+           family = "poisson",
+           data = ca_zipcode_clean3)
+
+draw(mod)
+
+
+mod_env_to_human <- gam(meta_activity ~ s(tickinf_prob), data = ca_zipcode_clean3, family = "poisson")
+summary(mod_env_to_human)
+draw(mod_env_to_human)
+
+# This allows you to find threshold regions where their combination leads to increased LDI.
+# te() fits a full interaction surface between tickinf_prob and meta_activity.
+mod <- gam(ldi_cat ~ te(tickinf_prob, meta_activity),
+           family = poisson(),
+           data = ca_zipcode_clean3)
+draw(mod)
+
+# ti() is a variation that allows for both main effects + interaction, if you want to separate them:
+mod2 <- gam(ldi_cat ~ ti(tickinf_prob) + ti(meta_activity) + ti(tickinf_prob, meta_activity),
+            family = poisson(),
+            data = ca_zipcode_clean3)
+draw(mod2)
+
+vis.gam(mod, view = c("tickinf_prob", "meta_activity"),
+        plot.type = "contour", color = "topo")
+
+# ou can identify thresholds of environmental risk where, given human activity, the LDI risk increases rapidly.
+
+mod_additive <- gam(ldi_cat ~ s(tickinf_prob) + s(meta_activity),
+                    family = poisson(), data = ca_zipcode_clean3)
+
+mod_interaction <- gam(ldi_cat ~ te(tickinf_prob, meta_activity),
+                       family = poisson(), data = ca_zipcode_clean3)
+
+anova(mod_additive, mod_interaction, test = "Chisq")
+# 1632.2      13262 5.8102   84.722 2.871e-16 ***
+# If the interaction model significantly improves fit, it means the combined effect is important beyond just additive effects.
+
+
+
+
+library(gratia)
+library(dplyr)
+library(ggplot2)
+
+# Step 1: Define a sequence of tickinf_prob values
+tick_seq <- seq(min(ca_zipcode_clean3$tickinf_prob, na.rm = TRUE),
+                max(ca_zipcode_clean3$tickinf_prob, na.rm = TRUE),
+                length.out = 100)
+
+# Step 2: Choose representative levels of meta_activity (e.g. low, medium, high)
+meta_levels <- quantile(ca_zipcode_clean3$meta_activity, probs = c(0.1, 0.5, 0.9), na.rm = TRUE)
+meta_levels <- quantile(ca_zipcode_clean3$meta_activity, probs = seq(0.1, 0.9, by = 0.2), na.rm = TRUE)
+
+# Step 3: Create a new dataset for prediction
+newdata <- expand.grid(
+  tickinf_prob = tick_seq,
+  meta_activity = meta_levels
+)
+
+# Step 4: Predict from the GAM
+newdata$pred <- predict(mod, newdata = newdata, type = "response")
+
+# Step 5: Plot slices
+ggplot(newdata, aes(x = tickinf_prob, y = pred, color = as.factor(meta_activity))) +
+  geom_line(size = 1.2) +
+  scale_color_viridis_d(name = "Human activity level", labels = c("Low", "Medium", "High")) +
+  labs(
+    x = "Environmental Suitability (tickinf_prob)",
+    y = "Predicted LDI",
+    title = "Effect of Environmental Risk on LDI at Different Human Activity Levels"
+  ) +
+  theme_minimal()
+
+# Each line shows how LDI changes with environmental risk, at a fixed level of human activity.
+# If lines diverge or show different slopes, the interaction is non-additive, and the effect of environmental risk depends on human presence.
+
+
+
+# Great — if you want to quantify thresholds where environmental risk (tickinf_prob) and human activity (meta_activity) combine to significantly increase LDI cases, you have several robust options depending on how precise or flexible you want to be.
+
+mod <- gam(ldi_cat ~ te(tickinf_prob, meta_activity),
+           family = poisson(),
+           data = ca_zipcode_clean3)
+
+# Compute derivatives (slope) with respect to tickinf_prob at different human activity levels
+derivs <- derivatives(mod,
+                      term = "tickinf_prob",
+                      by = "meta_activity",
+                      n = 200, partial_match = TRUE,
+                      interval = "confidence")
+
+# Plot where slope is significantly different from 0
+draw(derivs)
+
+
+library(visreg)
+
+# Visualize effect of tickinf_prob at multiple levels of meta_activity -- LOOK INTO THIS MORE
+# This shows conditional effect lines (with CIs), giving you a visual feel for thresholds.
+visreg(mod, "tickinf_prob", by = "meta_activity", 
+       breaks = 3, overlay = TRUE, partial = FALSE, rug = FALSE)
+
+
+# Create grid
+tick_seq <- seq(min(ca_zipcode_clean3$tickinf_prob), max(ca_zipcode_clean3$tickinf_prob), length.out = 100)
+meta_seq <- seq(min(ca_zipcode_clean3$meta_activity), max(ca_zipcode_clean3$meta_activity), length.out = 100)
+
+grid <- expand.grid(
+  tickinf_prob = tick_seq,
+  meta_activity = meta_seq
+)
+
+grid$pred <- predict(mod, newdata = grid, type = "response")
+
+# Visualize surface to find thresholds
+library(ggplot2)
+ggplot(grid, aes(x = tickinf_prob, y = meta_activity, fill = pred)) +
+  geom_tile() +
+  scale_fill_viridis_c(name = "Predicted LDI", option = "C", direction = -1) +
+  labs(title = "Predicted LDI based on tick risk and human activity") +
+  theme_minimal()
+
+
+
+library(segmented)
+# First, fit linear model (or GLM) -- maybe explore more?
+lm_mod <- glm(ldi_cat ~ tickinf_prob + meta_activity, data = ca_zipcode_clean3, family = poisson())
+
+# Fit segmented model
+seg_mod <- segmented(lm_mod, seg.Z = ~tickinf_prob)
+
+summary(seg_mod)
+plot(seg_mod)
+
+# Use full smooth name with partial match
+evaluate_smooth(mod, select = "te(tickinf_prob,meta_activity)", n = 100)
+```
+
+
+try running gam spatial smooth
+```{r}
+# Get one row per zip_code with geometry intact
+unique_zip_sf <- ca_zipcode_clean3 %>%
+  group_by(zip_code) %>%
+  slice(1) %>%
+  ungroup()
+
+# Calculate centroids to get one point per polygon/feature
+zip_centroids <- st_centroid(unique_zip_sf)
+
+# Extract coordinates of centroids (one per feature)
+coords <- st_coordinates(zip_centroids)
+
+# Combine coordinates with zip_code attribute
+latlon_clean <- zip_centroids %>%
+  st_drop_geometry() %>%
+  mutate(lon = coords[,1],
+         lat = coords[,2]) %>%
+  dplyr::select(zip_code, lon, lat)
+
+
+ca_zipcode_clean4 <- ca_zipcode_clean3 %>% 
+  left_join(latlon_clean)
+
+mod2 <- gam(ldi_cat ~ te(tickinf_prob, meta_activity),
+           family = poisson(),
+           data = ca_zipcode_clean4)
+
+mod <- gam(ldi_cat ~ te(tickinf_prob, meta_activity) + s(lat, lon, bs = "gp"),
+           family = poisson(),
+           data = ca_zipcode_clean4)
+draw(mod)
+
+summary(mod )
+
+
+library(visreg)
+
+# Visualize effect of tickinf_prob at multiple levels of meta_activity -- LOOK INTO THIS MORE
+# This shows conditional effect lines (with CIs), giving you a visual feel for thresholds.
+visreg(mod, "tickinf_prob", by = "meta_activity", 
+       breaks = 3, overlay = TRUE, partial = FALSE, rug = TRUE)
+
+# effect of tick on LDI but conditioning on the plot at several levels of huma activity
+# splits activity into 3 quantiles
+# overlay = TRUE plots same graph
+# partial = FLSE, so we're seeing marginal effects not individual data points
+# rug = FALSE
+# each line repreesnts the predicted effect of envir on LDI at a different level of human activity
+# suggests interaction: relationship between enviro and LD depends on human activity
+
+```
+
+
+go back to bayesian modeling
+```{r}
+library(tidyverse)
+library(sf)
+library(spdep)
+library(INLA)
+
+# --- 1. Read and prepare LDI shapefile data
+ldi_crs <- st_read("data/raw/LD_incidence/CA_Zips_Lyme_NAD83.shp") %>%
+  st_transform(st_crs(ca_shp)) %>%
+  select(ZIP_CODE, PO_NAME, LDI_Cat, NAMELSAD) 
+
+# --- 2. Join with population data and calculate observed cases (Y)
+ldi_cases <- ldi_crs %>%
+  left_join(ca_pop %>% rename(ZIP_CODE = GEOID), by = "ZIP_CODE") %>%
+  mutate(
+    total_pop = replace_na(total_pop, 0),
+    ldi_totalcases = (LDI_Cat / 100000) * total_pop * 13,
+    Y = round(ldi_totalcases)
+  ) %>%
+  st_make_valid()
+
+# --- 3. Calculate expected counts (E)
+total_Y <- sum(ldi_cases$Y, na.rm = TRUE)
+total_pop_years <- sum(ldi_cases$total_pop * 13 / 100000, na.rm = TRUE)
+global_rate <- total_Y / total_pop_years
+
+E <- (ldi_cases$total_pop / 100000) * 13 * global_rate
+E <- pmax(E, 0.001)  # prevent E = 0
+
+
+# --- 4. Prepare modeling dataset: merge with environmental covariates
+ca_zipcode_clean3 <- ca_zipcode_clean %>%
+  select(zip_code, po_name, ldi_cat, meta_activity, tickinf_prob, index, ID) %>%
+  left_join(
+    ldi_cases %>% 
+      st_drop_geometry() %>%
+      select(ZIP_CODE, Y, ldi_totalcases,total_pop) %>%
+      rename(zip_code = ZIP_CODE),
+    by = "zip_code"
+  ) %>%
+  mutate(index_z = scale(index))
+
+
+## try fixing
+total_Y <- sum(ca_zipcode_clean3$Y, na.rm = TRUE)
+total_pop_years <- sum(ca_zipcode_clean3$total_pop * 13 / 100000, na.rm = TRUE)
+global_rate <- total_Y / total_pop_years
+E <- (ca_zipcode_clean3$total_pop / 100000) * 13 * global_rate
+E <- pmax(E, 0.001)
+
+
+# --- 5. Create adjacency matrix from spatial polygons
+zip_sp <- as_Spatial(ca_zipcode_clean3)
+nb <- poly2nb(zip_sp)
+nb2INLA("zip.adj", nb)
+adjacency <- "zip.adj"
+
+## scale
+ca_zipcode_clean3$meta_activity_z <- scale(ca_zipcode_clean3$meta_activity)
+ca_zipcode_clean3$tickinf_prob_z <- scale(ca_zipcode_clean3$tickinf_prob)
+
+# --- 6. Fit BYM2 spatial model using INLA
+formula <- Y ~ meta_activity_z + tickinf_prob_z + (meta_activity_z*tickinf_prob_z) + f(ID, model = "bym2", graph = adjacency, scale.model = TRUE)
+
+result <- inla(
+  formula,
+  family = "poisson",
+  data = ca_zipcode_clean3,
+  E = E,
+  control.predictor = list(compute = TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE)
+)
+
+# --- 7. Add fitted RR (relative risk) to output
+ca_zipcode_clean3$RR <- result$summary.fitted.values$mean
+
+# --- 8. Visualize RR using LDI shapefile
+
+ggplot(ca_zipcode_clean3) +
+  geom_sf(aes(fill = RR), color = NA) +
+  scale_fill_viridis_c(option = "C", direction  = -1) +
+  labs(
+    title = "Estimated Relative Risk (LDI - BYM2)",
+    fill = "RR"
+  ) +
+  theme_minimal()
+
+
+summary(result)$fixed
+exp_beta <- exp(result$summary.fixed["index_z", "mean"])
+result$summary.fitted.values
+ca_zipcode_clean3$RR <- result$summary.fitted.values$mean
+
+ggplot() +
+  geom_sf(data = ca_zipcode_clean3, aes(fill = RR), color = NA) +
+  geom_sf(data = casp_districtdivision_shp2, fill = NA, color = "black") +
+  scale_fill_viridis_c(option = "C", direction = -1) +
+  labs(
+    title = "Estimated Relative Risk (BYM2 Model)",
+    fill = "Relative Risk"
+  ) +
+  theme_void()
+
+## plot covariate effect
+fixed_effect <- result$summary.fixed["index_z", ]
+intercept <- result$summary.fixed["(Intercept)", ]
+
+index_seq <- seq(min(ca_zipcode_clean3$index_z, na.rm = TRUE),
+                 max(ca_zipcode_clean3$index_z, na.rm = TRUE),
+                 length.out = 100)
+
+# Calculate predicted log RR
+log_rr <- intercept["mean"] + fixed_effect["mean"] * index_seq
+rr <- exp(log_rr)
+
+plot(index_seq, rr, type = "l", lwd = 2, col = "blue",
+     xlab = "Scaled Environmental Index (index_z)",
+     ylab = "Predicted Relative Risk",
+     main = "Effect of Environmental Index on Relative Risk")
+
+
+ca_zipcode_clean3$RR_sd <- result$summary.fitted.values$sd
+
+ggplot() +
+  geom_sf(data = casp_districtdivision_shp2, fill = NA, color = "black") +
+  geom_sf(data = ca_zipcode_clean3, aes(fill = RR_sd)) +
+  scale_fill_viridis_c(option = "C", direction = -1) +
+  labs(title = "Uncertainty in Estimated Relative Risk (SD)", fill = "SD") +
+  theme_minimal()
+# After accounting for spatial correlation, areas with a one standard deviation higher environmental index have about 34% higher relative risk of Lyme disease incidence compared to average areas, with 95% credible interval ranging from 9% to 64% increase.
+  casp_districtdivision_shp2 <- casp_districtdivision_shp %>% st_transform(st_crs(ca_shp))
+
+
+```
+
+
+check for overdispersion -- run negative binomial (come back to this model!)
+```{r}
+mean_Y <- mean(ca_zipcode_clean3$Y, na.rm = TRUE)
+var_Y <- var(ca_zipcode_clean3$Y, na.rm = TRUE)
+print(c(mean = mean_Y, variance = var_Y))
+
+result_nb <- inla(
+  formula,
+  family = "nbinomial",
+  data = ca_zipcode_clean3,
+  E = E,  # expected cases
+  control.predictor = list(compute = TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE)
+)
+
+
+# Poisson model
+result$dic$dic
+result$waic$waic
+
+# NB model
+result_nb$dic$dic
+result_nb$waic$waic
+
+
+# --- 7. Add fitted RR (relative risk) to output
+ca_zipcode_clean3$RR <- result_nb$summary.fitted.values$mean
+
+# --- 8. Visualize RR using LDI shapefile
+
+ggplot(ca_zipcode_clean3) +
+  geom_sf(aes(fill = RR), color = NA) +
+  scale_fill_viridis_c(option = "C", direction  = -1) +
+  labs(
+    title = "Estimated Relative Risk (LDI - BYM2)",
+    fill = "RR"
+  ) +
+  theme_minimal()
+
+
+summary(result_nb)$fixed
+exp_beta <- exp(result_nb$summary.fixed["index_z", "mean"])
+result_nb$summary.fitted.values
+ca_zipcode_clean3$RR <- result_nb$summary.fitted.values$mean
+
+ggplot() +
+  geom_sf(data = ca_zipcode_clean3, aes(fill = RR), color = NA) +
+  geom_sf(data = casp_districtdivision_shp2, fill = NA, color = "black") +
+  scale_fill_viridis_c(option = "C", direction = -1) +
+  labs(
+    title = "Estimated Relative Risk (BYM2 Model)",
+    fill = "Relative Risk"
+  ) +
+  theme_void()
+
+## plot covariate effect
+fixed_effect <- result_nb$summary.fixed["index_z", ]
+intercept <- result_nb$summary.fixed["(Intercept)", ]
+
+index_seq <- seq(min(ca_zipcode_clean3$index_z, na.rm = TRUE),
+                 max(ca_zipcode_clean3$index_z, na.rm = TRUE),
+                 length.out = 100)
+
+# Calculate predicted log RR
+log_rr <- intercept["mean"] + fixed_effect["mean"] * index_seq
+rr <- exp(log_rr)
+
+plot(index_seq, rr, type = "l", lwd = 2, col = "blue",
+     xlab = "Scaled Environmental Index (index_z)",
+     ylab = "Predicted Relative Risk",
+     main = "Effect of Environmental Index on Relative Risk")
+
+
+ca_zipcode_clean3$RR_sd <- result_nb$summary.fitted.values$sd
+
+ggplot() +
+  geom_sf(data = casp_districtdivision_shp2, fill = NA, color = "black") +
+  geom_sf(data = ca_zipcode_clean3, aes(fill = RR_sd)) +
+  scale_fill_viridis_c(option = "C", direction = -1) +
+  labs(title = "Uncertainty in Estimated Relative Risk (SD)", fill = "SD") +
+  theme_minimal()
+# After accounting for spatial correlation, areas with a one standard deviation higher environmental index have about 34% higher relative risk of Lyme disease incidence compared to average areas, with 95% credible interval ranging from 9% to 64% increase.
+
+#mean    sd 0.025quant 0.5quant 0.975quant   mode kld
+#(Intercept)                    -0.975 0.147     -1.259   -0.966     -0.708 -0.937   0
+#meta_activity_z                -0.143 0.099     -0.337   -0.143      0.050 -0.143   0
+#tickinf_prob_z                  0.445 0.108      0.234    0.445      0.656  0.445   0
+#meta_activity_z:tickinf_prob_z  0.019 0.087     -0.153    0.019      0.190  0.019   0
+
+```
+
+try now within state parks
+```{r}
+park_summary <- casp_fulldata_annual %>%
+  group_by(UNITNAME) %>%
+  summarise(
+    mean_tick_prob = mean(tick_year_inf, na.rm = TRUE),
+    mean_activity = mean(meta_year_max_activity, na.rm = TRUE)
+  )
+
+# Get park centroids or park polygons
+park_sf <- st_as_sf(park_summary) %>% st_transform(st_crs(ca_zipcode_clean4))  # ensure it has geometry
+
+# Spatial join: assign parks to ZIPs based on intersection or centroid within
+parks_with_zip <- st_join(park_sf, ca_zipcode_clean4, join = st_intersects)
+
+# Now aggregate park-level data to ZIP level
+zipcode_park_means <- parks_with_zip %>%
+  group_by(zip_code) %>%
+  summarise(
+    avg_tick_prob = mean(mean_tick_prob, na.rm = TRUE),
+    avg_activity = mean(mean_activity, na.rm = TRUE)
+  ) %>% st_drop_geometry()
+
+model_data <- ca_zipcode_clean4 %>%
+  left_join(zipcode_park_means, by = "zip_code")
+formula <- Y ~ meta_activity_z + tickinf_prob_z + (meta_activity_z*tickinf_prob_z) + f(ID, model = "bym2", graph = adjacency, scale.model = TRUE)
+
+model_data$meta_activity_z <- scale(model_data$avg_activity)
+model_data$tickinf_prob_z <- scale(model_data$avg_tick_prob)
+
+mean_Y <- mean(model_data$Y, na.rm = TRUE)
+var_Y <- var(model_data$Y, na.rm = TRUE)
+print(c(mean = mean_Y, variance = var_Y))
+
+result_nb2 <- inla(
+  formula,
+  family = "nbinomial",
+  data = model_data,
+  E = E,  # expected cases
+  control.predictor = list(compute = TRUE),
+  control.compute = list(dic = TRUE, waic = TRUE)
+)
+
+# --- 7. Add fitted RR (relative risk) to output
+model_data$RR <- result_nb2$summary.fitted.values$mean
+
+# --- 8. Visualize RR using LDI shapefile
+
+ggplot(model_data) +
+  geom_sf(aes(fill = RR), color = NA) +
+  scale_fill_viridis_c(option = "C", direction  = -1) +
+  labs(
+    title = "Estimated Relative Risk (LDI - BYM2)",
+    fill = "RR"
+  ) +
+  theme_minimal()
+
+
+summary(result_nb2)$fixed
+```
+
+visualize them
+```{r}
+# State park aggregated model
+coefs_park <- as.data.frame(summary(result_nb2)$fixed)
+coefs_park$term <- rownames(coefs_park)
+coefs_park$model <- "State Park Aggregated"
+
+# ZIP code-level model
+coefs_zip <- as.data.frame(summary(result_nb)$fixed)
+coefs_zip$term <- rownames(coefs_zip)
+coefs_zip$model <- "ZIP Code Level"
+
+# Combine
+coef_df <- bind_rows(coefs_park, coefs_zip)
+
+coef_df <- coef_df %>%
+  mutate(
+    term = case_when(
+      term == "(Intercept)" ~ "Intercept",
+      term == "meta_activity_z" ~ "Human Activity",
+      term == "tickinf_prob_z" ~ "Environmental Tick Risk",
+      term == "meta_activity_z:tickinf_prob_z" ~ "Interaction (human*environment)",
+      TRUE ~ term
+    )
+  )
+
+
+
+ggplot(coef_df, aes(x = term, y = mean, ymin = `0.025quant`, ymax = `0.975quant`, color = model)) +
+  geom_pointrange(position = position_dodge(width = 0.4), size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Coefficient Estimate (95% CI)",
+    title = "Effect Estimates: State Park vs ZIP Code Models"
+  ) +
+  scale_color_manual(values = c("State Park Aggregated" = "#0072B2", "ZIP Code Level" = "#D55E00")) +
+  theme_minimal(base_size = 13) 
+
+coef_df %>% 
+  filter(term != "Intercept") %>% 
+ggplot(aes(y = term, x = mean, xmin = `0.025quant`, xmax = `0.975quant`, color = model)) +
+  geom_pointrange(position = position_dodge(width = 0.5), size = 0.9) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    x = "Coefficient Estimate (95% CI)",
+    y = NULL,
+    title = "Effect Estimates: State Park vs ZIP Code Models"
+  ) +
+  scale_color_manual(values = c("State Park Aggregated" = "darkgreen", "ZIP Code Level" = "#D55E00")) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+
+
+
+coef_df %>% 
+  filter(term != "Intercept") %>% 
+ggplot(aes(y = mean, x = term, ymin = `0.025quant`, ymax = `0.975quant`, color = model)) +
+  geom_pointrange(position = position_dodge(width = 0.5), size = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    y = "Coefficient Estimate (95% CI)",
+    x = NULL,
+    title = "Effect Estimates on human reported Lyme disease incidence"
+  ) +
+  scale_color_manual(values = c("State Park Aggregated" = "darkgreen", "ZIP Code Level" = "#D55E00")) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+
+## whil ehuman activity alone is associated wiht lower LDI, its interaction with enviornmental risk significantly increases disease incidence. this spports the hypothesis thtat ld risk is driven by the co-occurrence of human exposure and ecologically suitabiliy
+```
+
+
+
+acs total population 
+(too many gaps (n > 45))
+
+```{r}
+census_api_key("7c6ef05b5134350077eb61afffdfc0702e3636a4")
+
+acs_data <- get_acs(geography = "zcta",
+                    variables = c(total_pop = "B01001_001"),
+                    year = 2023, 
+                    survey = "acs5", 
+                    output = "wide")
+
+# filter for just CA zipcodes
+ca_zips <- unique(ldi_clean$zip_code)
+length(ca_zips) # 1721 doesnt have forest zipcodes
+
+acs_ca <- acs_data %>% filter(GEOID %in% ca_zips) %>% 
+  rename(zip_code = GEOID) %>% 
+  dplyr::select(zip_code, total_popE) %>% 
+  rename(total_pop = total_popE)
+
+ldi_clean %>% 
+  left_join(acs_ca) %>% 
+  st_drop_geometry() %>% 
+  filter(is.na(total_pop)) %>% 
+  mutate(total_pop = case_when(grepl("National Forest", po_name) ~ 0,
+                               grepl("Ntl Forest", po_name) ~ 0,
+                               grepl("Ntl Park", po_name) ~ 0,
+                               TRUE ~ total_pop)) %>% 
+  filter(is.na(total_pop)) 
+  
+```
+  
+
+more population failrs
+```{r}
+# https://www.california-demographics.com/zip_codes_by_population
+ca_total_pop <- ca_total_pop %>% 
+  mutate(total_pop = gsub(",", "", total_pop),
+         total_pop = as.numeric(total_pop),
+         zip_code = as.character(zip_code))
+```
+
+  
+  triage model from 10-03-2025
+  
+triage
+```{r}
+# check if same length - both 1716
+readLines("zip.adj")[1]
+nrow(ldi_annual_zip_model)
+
+# check skew - mean centered 0
+summary(ldi_annual_zip_model$zip_meta_activity_z)
+summary(ldi_annual_zip_model$zip_tickinf_prob_z)
+
+# check for collinearity - -0.16
+cor(ldi_annual_zip_model$zip_meta_activity_z, ldi_annual_zip_model$zip_tickinf_prob_z, use = "complete.obs")
+
+# expected counts too low? - Y is highly overdispersed but Y and E on same scale
+summary(ldi_annual_zip_model$Y)
+summary(E)
+
+# misalignment? - all polygons have neighbors
+which(card(nb) == 0)
+```
+
+
+diagnostics
+```{r}
+
+# Extract fitted means on response scale
+fitted_means <- zip_result_nb$summary.fitted.values$mean
+
+# Plot observed vs fitted
+plot(ldi_annual_zip_model$Y, fitted_means,
+     xlab = "Observed counts",
+     ylab = "Fitted means",
+     main = "Observed vs Fitted")
+
+abline(a=0, b=1, col="red")
+
+# Pearson residuals
+pearson_resid <- (ldi_annual_zip_model$Y - fitted_means) / sqrt(fitted_means)
+
+# Histogram
+hist(pearson_resid, breaks=30, main="Histogram of Pearson Residuals", xlab="Pearson residuals")
+
+# Plot residuals vs fitted
+plot(fitted_means, pearson_resid,
+     xlab="Fitted values",
+     ylab="Pearson residuals",
+     main="Residuals vs Fitted")
+abline(h=0, col="red")
+
+library(spdep)
+
+# Assuming ldi_annual_zip_model is an sf object with geometry
+
+# Extract neighbors list from adjacency (if adjacency is a graph)
+# You might need to convert adjacency matrix to listw object
+
+# Example if adjacency is a matrix or graph:
+nb <- spdep::graph2nb(adjacency)
+listw <- spdep::nb2listw(nb, style = "W")
+
+# Moran's I test on Pearson residuals
+moran.test(pearson_resid, listw)
+
+library(ggplot2)
+
+ldi_annual_zip_model$pearson_resid <- pearson_resid
+
+ggplot(ldi_annual_zip_model) +
+  geom_sf(aes(fill = pearson_resid)) +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  labs(fill = "Pearson Residuals", title = "Spatial Pattern of Residuals")
+
+
+```
+
+relative risk map
+```{r}
+ggplot(ldi_annual_zip_model) +
+  geom_sf(aes(fill = RRmean)) +
+  scale_fill_viridis_c(option = "C", direction = -1) +
+  labs(title = "Estimated Relative Risk (BYM2)", fill = "RR") +
+  theme_minimal()
+```
+
+posterior mapping (do this) - look at this again
+```{r}
+# Define posterior summaries
+posterior_df <- data.frame(
+  term = c("Intercept", "CASP Meta Activity (z)", 
+           "CASP Tick Inf Prob (z)", 
+           "Interaction (Activity × TickInfProb)"),
+  mean = c(-1.074, -0.855, 0.632, 1.934),
+  sd = c(0.084, 0.888, 0.619, 2.069)
+)
+
+# Create a data frame for plotting
+plot_data <- posterior_df %>%
+  rowwise() %>%
+  do({
+    x <- seq(-6, 6, length.out = 1000)
+    y <- dnorm(x, mean = .$mean, sd = .$sd)
+    data.frame(term = .$term, x = x, y = y)
+  })
+
+# Plot
+ggplot(plot_data, aes(x = x, y = y)) +
+  geom_line(color = "steelblue") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+  facet_wrap(~ term, scales = "free", ncol = 2) +
+  labs(title = "Posterior Distributions of Fixed Effects",
+       x = "Coefficient Value", y = "Density") +
+  theme_minimal()
+
+```
+
+
+
+
+```{r}
+district_boundary <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp")
+
+
+
+
+district_outline <- district_boundary %>%
+  filter(district == "Gold Fields District"| district == "Sierra District")  
+
+
+bbox <- st_bbox(c(xmin = -180, xmax = -120, ymin = 30, ymax = 50), crs = st_crs(district_outline))
+
+# Crop the district_outline to match
+district_outline_filtered <- st_crop(district_outline, bbox)
+
+
+casp_fulldata_monthly4 <- casp_fulldata_monthly %>%
+  filter((district == "Gold Fields District" | 
+          district == "Sierra District")) %>% #month == 2
+  st_make_valid() %>%
+  mutate(
+    tick_monthly_presence_z = scale(tick_monthly_presence),
+    flickrgbif_estimatedvisits_z = scale(flickrgbif_estimatedvisits),
+    index_z = tick_monthly_presence_z * flickrgbif_estimatedvisits_z
+  ) %>%
+  filter(!is.na(index_z)) %>% 
+  mutate(index_quartile = ntile(index_z, 4),  # Break into 4 quantiles
+    index_cat = factor(index_quartile, levels = 1:4,
+                       labels = c("Low", "Moderate", "High", "Very High")))
+
+
+casp_centroids <- st_centroid(casp_fulldata_monthly4)
+
+
+casp_centroids %>% 
+  mutate(
+    lon = st_coordinates(.)[, 1],
+    lat = st_coordinates(.)[, 2]) %>% 
+  filter(lon <= -120) %>% 
+ggplot() +
+  geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 3, alpha = 0.9) +
+  #geom_sf(aes(fill = index_cat), color = "black", size = 0.1) +
+  scale_fill_manual(
+    values = c("Low" = "#440154FF",
+               "Moderate" = "#3B528BFF",
+               "High" = "#21908CFF",
+               "Very High" = "#FDE725FF"),
+    name = "Composite Index\n(Quartiles)"
+  ) +
+  labs(title = "Composite Tick-Human Activity Index") +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)) +
+  geom_sf(data = district_outline_filtered, fill = NA, color = "black", size = 0.6) +
+  facet_wrap(~month)
+
+unique(district_boundary$district)
+```
+
+
+```{r}
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+# 1. Load district boundaries
+district_boundary <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp")
+
+# 2. Filter only Gold Fields and Sierra districts
+district_outline <- district_boundary %>%
+  filter(district %in% c("Gold Fields District", "Sierra District"))
+
+# 3. Crop to western portion (longitude <= -120)
+bbox <- st_bbox(c(xmin = -180, xmax = -120, ymin = 30, ymax = 50), crs = st_crs(district_outline))
+district_outline_filtered <- st_crop(district_outline, bbox)
+
+# 4. Process park-level data
+casp_fulldata_monthly4 <- casp_fulldata_monthly %>%
+  filter(district %in% c("Gold Fields District", "Sierra District")) %>%
+  st_make_valid() %>%
+  mutate(
+    tick_monthly_presence_z = scale(tick_monthly_presence),
+    flickrgbif_estimatedvisits_z = scale(flickrgbif_estimatedvisits),
+    index_z = tick_monthly_presence_z * flickrgbif_estimatedvisits_z
+  ) %>%
+  filter(!is.na(index_z)) %>%
+  mutate(
+    index_quartile = ntile(index_z, 4),
+    index_cat = factor(index_quartile, levels = 1:4,
+                       labels = c("Low", "Moderate", "High", "Very High"))
+  )
+
+# 5. Compute centroids and filter by longitude
+casp_centroids <- casp_fulldata_monthly4 %>%
+  st_centroid() %>%
+  mutate(
+    lon = st_coordinates(.)[, 1],
+    lat = st_coordinates(.)[, 2]
+  ) %>%
+  filter(lon <= -120)
+
+# 6. Plot
+ggplot() +
+  geom_sf(data = casp_centroids, aes(fill = index_cat), shape = 21,
+          color = "black", size = 3, alpha = 0.9) +
+  geom_sf(data = district_outline_filtered, fill = NA, color = "black", size = 0.6) +
+  scale_fill_manual(
+    values = c(
+      "Low" = "#440154FF",
+      "Moderate" = "#3B528BFF",
+      "High" = "#21908CFF",
+      "Very High" = "#FDE725FF"
+    ),
+    name = "Composite Index\n(Quartiles)"
+  ) +
+  labs(title = "Composite Tick-Human Activity Index") +
+  facet_wrap(~month) +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+
+
+
+# Reproject both to a common CRS if needed
+target_crs <- 4326
+
+casp_centroids <- st_transform(casp_centroids, crs = target_crs)
+district_outline_filtered <- st_transform(district_outline_filtered, crs = target_crs)
+bbox <- st_bbox(c(xmin = -124, xmax = -120, ymin = 36, ymax = 41), crs = st_crs(district_outline))
+
+ggplot() +
+  geom_sf(data = district_outline_filtered, fill = NA, color = "black", size = 0.8) +  # draw first
+  geom_sf(data = casp_centroids, aes(fill = index_cat), shape = 21,
+          color = "black", size = 3, alpha = 0.9) +
+  scale_fill_manual(
+    values = c("Low" = "#440154FF",
+               "Moderate" = "#3B528BFF",
+               "High" = "#21908CFF",
+               "Very High" = "#FDE725FF"),
+    name = "Composite Index\n(Quartiles)"
+  ) +
+  labs(title = "Composite Tick-Human Activity Index") +
+  facet_wrap(~month) +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+```
+
+analysis from sunday 2025-10-05
+try temporal result
+
+```{r}
+nbw <- nb2listw(nb, style = "W")
+lmoran <- localmoran(ldi_annual_zip_model$Y, nbw, alternative = "two.sided")
+ldi_annual_zip_model3 <- ldi_annual_zip_model
+ldi_annual_zip_model3$lmp <- lmoran[,5]
+
+mp <- moran.plot(as.vector(scale(ldi_annual_zip_model3$Y)), nbw)
+
+ldi_annual_zip_model3$quadrant <- NA
+# high-high
+ldi_annual_zip_model3[(mp$x >= 0 & mp$wx >= 0) & (ldi_annual_zip_model3$lmp <= 0.05), "quadrant"]<- 1
+# low-low
+ldi_annual_zip_model3[(mp$x <= 0 & mp$wx <= 0) & (ldi_annual_zip_model3$lmp <= 0.05), "quadrant"]<- 2
+# high-low
+ldi_annual_zip_model3[(mp$x >= 0 & mp$wx <= 0) & (ldi_annual_zip_model3$lmp <= 0.05), "quadrant"]<- 3
+# low-high
+ldi_annual_zip_model3[(mp$x <= 0 & mp$wx >= 0) & (ldi_annual_zip_model3$lmp <= 0.05), "quadrant"]<- 4
+# non-significant
+ldi_annual_zip_model3[(ldi_annual_zip_model3$lmp > 0.05), "quadrant"] <- 5
+
+library(tmap)
+
+tm_shape(ldi_annual_zip_model3) + tm_fill(col = "quadrant", title = "",
+breaks = c(1, 2, 3, 4, 5, 6),
+palette =  c("red", "blue", "lightpink", "skyblue2", "white"),
+labels = c("High-High", "Low-Low", "High-Low",
+           "Low-High", "Non-significant")) +
+tm_legend(text.size = 1)  + tm_borders(alpha = 0.5) +
+tm_layout(frame = FALSE,  title = "Clusters")  +
+tm_layout(legend.outside = TRUE)
+```
+
+```{r}
+## wrangle data
+
+casp_fulldata_monthly <- st_read("data/processed/casp_fulldata_monthly_nometa.gpkg")
+
+casp_fulldata_monthly2 <- casp_fulldata_monthly %>% 
+  mutate(tick_monthly_presence_z = scale(tick_monthly_presence),
+         flickrgbif_estimatedvisits_z = scale(flickrgbif_estimatedvisits)) %>% 
+  mutate(index_z = (tick_monthly_presence_z*flickrgbif_estimatedvisits_z)) %>% 
+  filter(!is.na(index_z)) %>% 
+  st_make_valid()
+
+casp_fulldata_monthly2 %>% filter(is.na(index_z ))
+## run the code
+zip_sp <- as_Spatial(casp_fulldata_monthly2)
+# now add ID
+casp_fulldata_monthly2$ID <- 1:nrow(casp_fulldata_monthly2)
+casp_fulldata_monthly2$ID <- as.integer(as.factor(casp_fulldata_monthly2$ID))
+
+nb <- poly2nb(zip_sp, row.names = as.character(casp_fulldata_monthly2$ID)) 
+nbw <- nb2listw(nb, style = "W")
+lmoran <- localmoran(as.vector(casp_fulldata_monthly2$index_z), nbw, alternative = "two.sided")
+casp_fulldata_monthly3 <- casp_fulldata_monthly2
+casp_fulldata_monthly3$lmp <- lmoran[,5]
+
+mp <- moran.plot(as.vector(scale(casp_fulldata_monthly3$index_z)), nbw)
+
+casp_fulldata_monthly3$quadrant <- NA
+# high-high
+casp_fulldata_monthly3[(mp$x >= 0 & mp$wx >= 0) & (casp_fulldata_monthly3$lmp <= 0.05), "quadrant"]<- 1
+# low-low
+casp_fulldata_monthly3[(mp$x <= 0 & mp$wx <= 0) & (casp_fulldata_monthly3$lmp <= 0.05), "quadrant"]<- 2
+# high-low
+casp_fulldata_monthly3[(mp$x >= 0 & mp$wx <= 0) & (casp_fulldata_monthly3$lmp <= 0.05), "quadrant"]<- 3
+# low-high
+casp_fulldata_monthly3[(mp$x <= 0 & mp$wx >= 0) & (casp_fulldata_monthly3$lmp <= 0.05), "quadrant"]<- 4
+# non-significant
+casp_fulldata_monthly3[(casp_fulldata_monthly3$lmp > 0.05), "quadrant"] <- 5
+
+library(tmap)
+
+tm_shape(casp_fulldata_monthly3) + tm_fill(col = "quadrant", title = "",
+breaks = c(1, 2, 3, 4, 5, 6),
+palette =  c("red", "blue", "lightpink", "skyblue2", "white"),
+labels = c("High-High", "Low-Low", "High-Low",
+           "Low-High", "Non-significant")) +
+tm_legend(text.size = 1)  + tm_borders(alpha = 0.5) +
+tm_layout(frame = FALSE,  title = "Clusters")  +
+tm_layout(legend.outside = TRUE)
+
+
+## make into ggplot
+cluster_labels <- c("1" = "High-High",
+  "2" = "Low-Low",
+  "3" = "High-Low",
+  "4" = "Low-High",
+  "5" = "Non-significant")
+
+cluster_colors <- c(
+  "1" = "red",
+  "2" = "blue",
+  "3" = "lightpink",
+  "4" = "skyblue2",
+  "5" = "white")
+
+ggplot(data = casp_fulldata_monthly3) +
+  geom_sf(aes(fill = as.factor(quadrant)), color = "black", size = 0.1, alpha = 0.8) +
+  scale_fill_manual(
+    values = cluster_colors,
+    labels = cluster_labels,
+    name = "Cluster Type"
+  ) +
+  labs(title = "Clusters") +
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5, size = 16),
+    axis.text = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  coord_sf(xlim = c(-121.5, -119.5), ylim = c(38.0, 40.8), expand = FALSE) 
+#coord_sf(xlim = c(-124.5, -119.5), ylim = c(38.0, 42.8), expand = FALSE) 
+```
+
+try just doing sonoma-mendocino
+```{r}
+
+library(sf)
+library(spdep)
+library(tidyverse)
+library(ggplot2)
+
+# Read spatial data
+casp_fulldata_monthly <- st_read("data/processed/casp_fulldata_monthly_nometa.gpkg")
+
+# Filter to one district and one month (January), calculate scaled composite index
+casp_fulldata_monthly4 <- casp_fulldata_monthly %>%
+  filter(district == "Sonoma-Mendocino Coast District" |
+           district == "Bay Area District" & month == 1) %>%
+  mutate(
+    tick_monthly_presence_z = scale(tick_monthly_presence),
+    flickrgbif_estimatedvisits_z = scale(flickrgbif_estimatedvisits),
+    index_z = tick_monthly_presence_z * flickrgbif_estimatedvisits_z
+  ) %>%
+  filter(!is.na(index_z)) %>%
+  st_make_valid()
+
+# Create spatial weights using centroids + distance-based neighbors
+casp_centroids <- st_centroid(casp_fulldata_monthly4)
+coords <- st_coordinates(casp_centroids)
+
+# Choose distance threshold (adjust as needed)
+#d_threshold <- 10000  # 10 km
+
+# Create neighbors and weights
+#nb <- dnearneigh(coords, d1 = 0, d2 = d_threshold)
+#nbw <- nb2listw(nb, style = "W")
+
+
+# Use k-nearest neighbors (e.g., k = 4)
+k <- 3  # You can adjust k based on density of your spatial units
+knn <- knearneigh(coords, k = k)
+nb <- knn2nb(knn)
+
+# Create spatial weights
+nbw <- nb2listw(nb, style = "W")
+
+# Run Local Moran's I
+lmoran <- localmoran(as.vector(casp_fulldata_monthly4$index_z), nbw, alternative = "two.sided")
+
+# Add results back to spatial data
+casp_fulldata_monthly4$lmp <- lmoran[, 5]
+casp_fulldata_monthly4$Ii  <- lmoran[, 1]
+
+# Get scaled values and spatial lag from moran.plot
+mp <- moran.plot(as.vector(scale(casp_fulldata_monthly4$index_z)), nbw, quiet = TRUE)
+
+# Assign cluster type (quadrant)
+casp_fulldata_monthly4$quadrant <- NA
+casp_fulldata_monthly4$quadrant[(mp$x >= 0 & mp$wx >= 0) & (casp_fulldata_monthly4$lmp <= 0.05)] <- 1  # High-High
+casp_fulldata_monthly4$quadrant[(mp$x <= 0 & mp$wx <= 0) & (casp_fulldata_monthly4$lmp <= 0.05)] <- 2  # Low-Low
+casp_fulldata_monthly4$quadrant[(mp$x >= 0 & mp$wx <= 0) & (casp_fulldata_monthly4$lmp <= 0.05)] <- 3  # High-Low
+casp_fulldata_monthly4$quadrant[(mp$x <= 0 & mp$wx >= 0) & (casp_fulldata_monthly4$lmp <= 0.05)] <- 4  # Low-High
+casp_fulldata_monthly4$quadrant[casp_fulldata_monthly4$lmp > 0.05] <- 5                                # Non-significant
+
+# Define colors and labels for ggplot
+cluster_colors <- c(
+  "1" = "red",        # High-High
+  "2" = "blue",       # Low-Low
+  "3" = "lightpink",  # High-Low
+  "4" = "skyblue2",   # Low-High
+  "5" = "white"       # Non-significant
+)
+
+cluster_labels <- c(
+  "1" = "High-High",
+  "2" = "Low-Low",
+  "3" = "High-Low",
+  "4" = "Low-High",
+  "5" = "Non-significant"
+)
+
+# Plot clusters
+ggplot(data = casp_fulldata_monthly4) +
+  geom_sf(aes(fill = as.factor(quadrant)), color = "black", size = 0.1, alpha = 0.9) +
+  scale_fill_manual(
+    values = cluster_colors,
+    labels = cluster_labels,
+    name = "Cluster Type"
+  ) +
+  labs(title = "Spatial Clusters (Local Moran's I) — January") +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5, size = 16)
+  )
+
+#unique(casp_fulldata_monthly$district)
+```
+
+try making points instead of polygons
+```{r}
+casp_centroids <- casp_centroids %>%
+  mutate(
+    quadrant = casp_fulldata_monthly4$quadrant,
+    lmp = casp_fulldata_monthly4$lmp,
+    Ii = casp_fulldata_monthly4$Ii
+  )
+casp_centroids$quadrant <- droplevels(as.factor(casp_centroids$quadrant))
+ggplot(data = casp_centroids) +
+  geom_sf(aes(color = as.factor(quadrant)), size = 3, alpha = 0.9) +
+  scale_color_manual(
+    values = cluster_colors,
+    labels = cluster_labels,
+    name = "Cluster Type"
+  ) +
+  labs(title = "Spatial Clusters (Local Moran's I, Centroids) — January") +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5, size = 16)
+  )
+
+
+ggplot() +
+  geom_sf(data = casp_fulldata_monthly4, fill = "gray95", color = "black", size = 0.1) +
+  geom_sf(data = casp_centroids, aes(color = as.factor(quadrant)), size = 3, alpha = 0.9) +
+  scale_color_manual(
+    values = cluster_colors,
+    labels = cluster_labels,
+    name = "Cluster Type"
+  ) +
+  labs(title = "Spatial Clusters (Polygons + Centroids)") +
+  theme_void() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10),
+    plot.title = element_text(hjust = 0.5, size = 16)
+  )
+
+
+
+
+
+# Identify which quadrant values are present
+present_quadrants <- unique(as.character(na.omit(casp_centroids$quadrant)))
+
+# Filter color and label mappings
+filtered_colors <- cluster_colors[present_quadrants]
+filtered_labels <- cluster_labels[present_quadrants]
+
+
+
+```
+
+
+try correlation
+```{r}
+casp_fulldata_monthly4 <- casp_fulldata_monthly %>%
+  filter((district == "Sonoma-Mendocino Coast District" | 
+          district == "Bay Area District") & 
+         month == 1) %>%
+  st_make_valid() %>%
+  mutate(
+    tick_monthly_presence_z = scale(tick_monthly_presence),
+    flickrgbif_estimatedvisits_z = scale(flickrgbif_estimatedvisits),
+    index_z = tick_monthly_presence_z * flickrgbif_estimatedvisits_z
+  ) %>%
+  filter(!is.na(index_z)) %>% 
+  mutate(index_quartile = ntile(index_z, 4),  # Break into 4 quantiles
+    index_cat = factor(index_quartile, levels = 1:4,
+                       labels = c("Low", "Moderate", "High", "Very High")))
+
+ggplot(casp_fulldata_monthly4) +
+  geom_sf(aes(fill = index_z), color = "black", size = 0.1) +
+  scale_fill_viridis_c(option = "plasma", name = "Spearman\nCorrelation") +
+  labs(title = "Index") +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+
+casp_centroids <- st_centroid(casp_fulldata_monthly4)
+
+ggplot(casp_centroids) +
+  geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 3, alpha = 0.9) +
+  #geom_sf(aes(fill = index_cat), color = "black", size = 0.1) +
+  scale_fill_manual(
+    values = c("Low" = "#440154FF",
+               "Moderate" = "#3B528BFF",
+               "High" = "#21908CFF",
+               "Very High" = "#FDE725FF"),
+    name = "Composite Index\n(Quartiles)"
+  ) +
+  labs(title = "Composite Tick-Human Activity Index (January)") +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)) +
+  geom_sf(data = district_outline, fill = NA, color = "black", size = 0.6)
+
+
+district_boundary <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp")
+district_outline <- district_boundary %>%
+  filter(district == "Sonoma-Mendocino Coast District"| district == "Bay Area District") 
+
+unique(casp_fulldata_monthly$district)
+```
+
+```{r}
+
+district_boundary <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp")
+
+district_outline2 <- district_boundary %>%
+  filter(district == "Sonoma-Mendocino Coast District"| district == "Bay Area District") 
+
+
+
+casp_fulldata_monthly4 <- casp_fulldata_monthly %>%
+  filter((district == "Sonoma-Mendocino Coast District" | 
+          district == "Bay Area District")) %>% #month == 2
+  st_make_valid() %>%
+  mutate(
+    tick_monthly_presence_z = scale(tick_monthly_presence),
+    flickrgbif_estimatedvisits_z = scale(flickrgbif_estimatedvisits),
+    index_z = tick_monthly_presence_z * flickrgbif_estimatedvisits_z
+  ) %>%
+  filter(!is.na(index_z)) %>% 
+  mutate(index_quartile = ntile(index_z, 4),  # Break into 4 quantiles
+    index_cat = factor(index_quartile, levels = 1:4,
+                       labels = c("Low", "Moderate", "High", "Very High")))
+
+
+casp_centroids <- st_centroid(casp_fulldata_monthly4)
+
+ggplot(casp_centroids) +
+  geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 3, alpha = 0.9) +
+  #geom_sf(aes(fill = index_cat), color = "black", size = 0.1) +
+  scale_fill_manual(
+    values = c("Low" = "#440154FF",
+               "Moderate" = "#3B528BFF",
+               "High" = "#21908CFF",
+               "Very High" = "#FDE725FF"),
+    name = "Composite Index\n(Quartiles)"
+  ) +
+  labs(title = "Composite Tick-Human Activity Index") +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)) +
+  geom_sf(data = district_outline, fill = NA, color = "black", size = 0.6) +
+  facet_wrap(~month)
+```
+
+
+
+```{r}
+library(sf)
+library(dplyr)
+library(ggplot2)
+
+# Read and filter to two districts
+district_outline <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp") %>%
+  filter(district %in% c("Gold Fields District", "Sierra District")) %>%
+  st_transform(crs = 4326)  # Ensure same CRS as rest of data
+
+# Define bbox in same CRS (WGS84)
+bbox <- st_bbox(c(xmin = -124, xmax = -120, ymin = 36, ymax = 41), crs = st_crs(district_outline))
+
+# Apply crop AFTER transformation
+district_outline_filtered <- st_crop(district_outline, bbox)
+
+
+casp_centroids <- st_centroid(casp_fulldata_monthly4) %>%
+  st_transform(crs = 4326) %>%
+  mutate(
+    lon = st_coordinates(.)[, 1],
+    lat = st_coordinates(.)[, 2]
+  ) %>%
+  filter(lon <= -120)
+
+
+ggplot() +
+  geom_sf(data = district_outline_filtered, fill = NA, color = "black", size = 0.8) +  # Outline first
+  geom_sf(data = casp_centroids, aes(fill = index_cat), shape = 21,
+          color = "black", size = 3, alpha = 0.9) +
+  scale_fill_manual(
+    values = c(
+      "Low" = "#440154FF",
+      "Moderate" = "#3B528BFF",
+      "High" = "#21908CFF",
+      "Very High" = "#FDE725FF"
+    ),
+    name = "Composite Index\n(Quartiles)"
+  ) +
+  labs(title = "Composite Tick-Human Activity Index") +
+  facet_wrap(~month) +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+
+
+```
+
+
+make inset map
+```{r}
+# Define bbox in same CRS (WGS84)
+bbox <- st_bbox(c(xmin = -124, xmax = -120, ymin = 36, ymax = 41), crs = st_crs(district_boundary))
+
+# Apply crop AFTER transformation
+focus_districts_filtered <- st_crop(focus_districts, bbox)
+
+
+
+# Read full district boundaries
+district_boundary <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp") %>%
+  st_transform(4326)
+
+# Subset for full state map
+state_outline <- district_boundary  # use for inset background
+
+# Subset your main area (e.g., Gold Fields + Sierra)
+focus_districts <- district_boundary %>%
+  filter(district %in% c("Gold Fields District", "Sierra District", "Sonoma-Mendocino Coast District", "Bay Area District"))  # or Bay Area etc.
+
+inset_map <- ggplot() +
+  geom_sf(data = state_outline, fill = "grey90", color = "white") +
+  geom_sf(data = focus_districts_filtered, fill = "tomato", color = "black", size = 0.8) +
+  theme_void()
+
+main_map <- ggplot() +
+  geom_sf(data = district_outline_filtered, fill = NA, color = "black", size = 0.6) +
+  geom_sf(data = casp_centroids, aes(fill = index_cat), shape = 21,
+          color = "black", size = 3, alpha = 0.9) +
+  scale_fill_manual(
+    values = c("Low" = "#440154FF",
+               "Moderate" = "#3B528BFF",
+               "High" = "#21908CFF",
+               "Very High" = "#FDE725FF"),
+    name = "Composite Index\n(Quartiles)"
+  ) +
+  labs(title = "Composite Tick-Human Activity Index") +
+  facet_wrap(~month) +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+
+main_map2 <- ggplot() + 
+  geom_sf(data = district_outline2, fill = NA, color = "black", size = 0.6) +
+  geom_sf(data = casp_centroids, aes(fill = index_cat), shape = 21,
+          color = "black", size = 3, alpha = 0.9) +
+  scale_fill_manual(
+    values = c("Low" = "#440154FF",
+               "Moderate" = "#3B528BFF",
+               "High" = "#21908CFF",
+               "Very High" = "#FDE725FF"),
+    name = "Composite Index\n(Quartiles)"
+  ) +
+  labs(title = "Composite Tick-Human Activity Index") +
+  facet_wrap(~month) +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+#main_map + main_map2 +
+#  inset_element(inset_map, left = 0.7, bottom = 0.7, right = 1, top = 1) 
+
+library(ggpubr)
+ggarrange(main_map + labs(title = NULL) + main_map2+ labs(title = NULL) + guides(fill = FALSE),
+          common.legend = TRUE, legend = "bottom",
+          heights = c(1,1), widths = c(1,1))
+```
+
+
+
+```{r}
+
+
+library(ggplot2)
+library(sf)
+library(ggpubr)
+
+# ---- Main Map 1 ----
+main_map <- ggplot() +
+  geom_sf(data = district_outline_filtered, fill = NA, color = "black", size = 0.6) +
+  geom_sf(data = casp_centroids, aes(fill = index_cat), shape = 21,
+          color = "black", size = 3, alpha = 0.9) +
+  scale_fill_manual(
+    values = c("Low" = "#440154FF",
+               "Moderate" = "#3B528BFF",
+               "High" = "#21908CFF",
+               "Very High" = "#FDE725FF"),
+    name = "Composite Index\n(Quartiles)"
+  ) +
+  facet_wrap(~month) +
+  theme_void() +
+  theme(
+    plot.title = element_blank(),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+# ---- Main Map 2 ----
+main_map2 <- ggplot() +
+  geom_sf(data = district_outline2, fill = NA, color = "black", size = 0.6) +
+  geom_sf(data = casp_centroids, aes(fill = index_cat), shape = 21,
+          color = "black", size = 3, alpha = 0.9) +
+  scale_fill_manual(
+    values = c("Low" = "#440154FF",
+               "Moderate" = "#3B528BFF",
+               "High" = "#21908CFF",
+               "Very High" = "#FDE725FF"),
+    name = "Composite Index\n(Quartiles)"
+  ) +
+  facet_wrap(~month) +
+  theme_void() +
+  theme(
+    plot.title = element_blank(),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)
+  )
+
+# ---- Arrange Maps with Shared Legend ----
+ggarrange(
+  main_map, main_map2,
+  ncol = 2,
+  common.legend = TRUE,
+  legend = "bottom"
+)
+
+
+
+
+# Get shared bounding box (adjust these based on your maps)
+shared_xlim <- c(-124, -119)
+shared_ylim <- c(36, 42)
+
+main_map <- main_map +
+  coord_sf(xlim = shared_xlim, ylim = shared_ylim, expand = FALSE)
+
+main_map2 <- main_map2 +
+  coord_sf(xlim = shared_xlim, ylim = shared_ylim, expand = FALSE)
+
+
+```
+
+
+
+```{r}
+
+ba_district_boundary <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp")
+district_outline <- district_boundary %>%
+  filter(district == "Sonoma-Mendocino Coast District"| district == "Bay Area District") 
+
+casp_fulldata_monthly4 <- casp_fulldata_monthly %>%
+  filter((district == "Sonoma-Mendocino Coast District" | 
+          district == "Bay Area District")) %>%
+  st_make_valid() %>%
+  mutate(
+    tick_monthly_presence_z = scale(tick_monthly_presence),
+    flickrgbif_estimatedvisits_z = scale(flickrgbif_estimatedvisits),
+    index_z = tick_monthly_presence_z * flickrgbif_estimatedvisits_z
+  ) %>%
+  filter(!is.na(index_z)) %>% 
+  mutate(index_quartile = ntile(index_z, 4),  # Break into 4 quantiles
+    index_cat = factor(index_quartile, levels = 1:4,
+                       labels = c("Low", "Moderate", "High", "Very High")))
+
+
+casp_centroids <- st_centroid(casp_fulldata_monthly4)
+
+
+map_ba_1 <- casp_centroids %>% 
+  filter(month == 1) %>% 
+ggplot() +
+  geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 3, alpha = 0.9) +
+  #geom_sf(aes(fill = index_cat), color = "black", size = 0.1) +
+  scale_fill_manual(
+    values = c("Low" = "#440154FF",
+               "Moderate" = "#3B528BFF",
+               "High" = "#21908CFF",
+               "Very High" = "#FDE725FF"),
+    name = "Composite Index\n(Quartiles)"
+  ) +
+  labs(title = "Composite Tick-Human Activity Index (January)") +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)) +
+  geom_sf(data = district_outline, fill = NA, color = "black", size = 0.6)
+
+
+map_ba_3 <- casp_centroids %>% 
+  filter(month == 3) %>% 
+ggplot() +
+  geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 3, alpha = 0.9) +
+  #geom_sf(aes(fill = index_cat), color = "black", size = 0.1) +
+  scale_fill_manual(
+    values = c("Low" = "#440154FF",
+               "Moderate" = "#3B528BFF",
+               "High" = "#21908CFF",
+               "Very High" = "#FDE725FF"),
+    name = "Composite Index\n(Quartiles)"
+  ) +
+  labs(title = "Composite Tick-Human Activity Index (January)") +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)) +
+  geom_sf(data = district_outline, fill = NA, color = "black", size = 0.6)
+
+map_ba_5 <- casp_centroids %>% 
+  filter(month == 5) %>% 
+ggplot() +
+  geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 3, alpha = 0.9) +
+  #geom_sf(aes(fill = index_cat), color = "black", size = 0.1) +
+  scale_fill_manual(
+    values = c("Low" = "#440154FF",
+               "Moderate" = "#3B528BFF",
+               "High" = "#21908CFF",
+               "Very High" = "#FDE725FF"),
+    name = "Composite Index\n(Quartiles)"
+  ) +
+  labs(title = "Composite Tick-Human Activity Index (January)") +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)) +
+  geom_sf(data = district_outline, fill = NA, color = "black", size = 0.6)
+
+map_ba_7 <- casp_centroids %>% 
+  filter(month == 7) %>% 
+ggplot() +
+  geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 3, alpha = 0.9) +
+  #geom_sf(aes(fill = index_cat), color = "black", size = 0.1) +
+  scale_fill_manual(
+    values = c("Low" = "#440154FF",
+               "Moderate" = "#3B528BFF",
+               "High" = "#21908CFF",
+               "Very High" = "#FDE725FF"),
+    name = "Composite Index\n(Quartiles)"
+  ) +
+  labs(title = "Composite Tick-Human Activity Index (January)") +
+  theme_void() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 16),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 10)) +
+  geom_sf(data = district_outline, fill = NA, color = "black", size = 0.6)
+
+
+ggarrange(map_ba_1 + labs(title = NULL), 
+          map_ba_3+ labs(title = NULL), map_ba_5+ labs(title = NULL), map_ba_7+ labs(title = NULL))
+```
+
+sonoma bay area
+```{r}
+
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(wesanderson)
+
+pal <- wes_palette("Zissou1", 4, type = "continuous")
+#print(pal[4])
+
+# Read district boundaries
+district_boundary <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp")
+
+# Filter to relevant districts
+district_outline <- district_boundary %>%
+  filter(district %in% c("Sonoma-Mendocino Coast District", "Bay Area District"))
+
+# Prepare and transform main data
+casp_fulldata_monthly4 <- casp_fulldata_monthly %>%
+  filter(district %in% c) %>%
+  st_make_valid() %>%
+  mutate(
+    tick_monthly_presence_z = scale(tick_monthly_presence),
+    flickrgbif_estimatedvisits_z = scale(flickrgbif_estimatedvisits),
+    index_z = tick_monthly_presence_z * flickrgbif_estimatedvisits_z
+  ) %>%
+  filter(!is.na(index_z)) %>%
+  mutate(
+    index_quartile = ntile(index_z, 4),
+    index_cat = factor(index_quartile, levels = 1:4,
+                       labels = c("Low", "Moderate", "High", "Very High"))
+  )
+
+# Calculate centroids
+casp_centroids <- st_centroid(casp_fulldata_monthly4)
+
+# Match CRS
+target_crs <- st_crs(district_outline)
+casp_centroids <- st_transform(casp_centroids, crs = target_crs)
+district_outline <- st_transform(district_outline, crs = target_crs)
+
+# Function to make map for a given month
+make_map <- function(data, month_num, title_month) {
+  data %>%
+    filter(month == month_num) %>%
+    ggplot() +
+    geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 2, alpha = 0.9) +
+    geom_sf(data = district_outline, fill = NA, color = "black", size = 0.6) +
+    scale_fill_manual(
+      values = c("Low" = "#3A9AB2", #"#440154FF",
+                 "Moderate" = "#ADC397", #"#3B528BFF",
+                 "High" = "#E5A208", #"#21908CFF",
+                 "Very High" = "#F11B00"), #"#FDE725FF"),
+      name = "Composite Index\n(Quartiles)"
+    ) +
+    labs(title = paste(title_month)) +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      plot.margin = unit(c(0.1, 0.1, 0.1, 0.1), "cm") 
+    )
+}
+
+# Create maps for selected months
+map_ba_1 <- make_map(casp_centroids, 1, "January")
+map_ba_3 <- make_map(casp_centroids, 3, "March")
+map_ba_4 <- make_map(casp_centroids, 3, "April")
+map_ba_5 <- make_map(casp_centroids, 5, "May")
+map_ba_7 <- make_map(casp_centroids, 7, "July")
+map_ba_9 <- make_map(casp_centroids, 9, "September")
+map_ba_10 <- make_map(casp_centroids, 3, "October")
+map_ba_11 <- make_map(casp_centroids, 11, "November")
+
+# Arrange maps in a grid (no titles for consistency)
+library(wesanderson)
+
+temp <- ggarrange(
+  map_ba_1, #+ labs(title = NULL),
+  map_ba_3, #+ labs(title = NULL),
+  map_ba_5, #+ labs(title = NULL),
+  map_ba_7, #+ labs(title = NULL),
+  map_ba_9,
+  map_ba_11,
+  ncol = 3, nrow = 2,
+  common.legend = TRUE, legend = "bottom"
+)
+
+temp_an <- annotate_figure(temp, top = "Bay Area-Sonoma")
+ggsave(temp_an, file = "temp.png", width = 5, height = 5, dpi = 300, bg = "white")
+
+```
+
+
+```{r}
+temp <- ggarrange(
+  map_ba_1, #+ labs(title = NULL),
+  map_ba_4, #+ labs(title = NULL),
+  map_ba_7, #+ labs(title = NULL),
+  map_ba_10, #+ labs(title = NULL),
+  #map_ba_9,
+  #map_ba_11,
+  ncol = 4, nrow = 1,
+  common.legend = TRUE, legend = "bottom"
+)
+
+
+```
+north red woods
+```{r}
+
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(wesanderson)
+
+pal <- wes_palette("Zissou1", 4, type = "continuous")
+#print(pal[4])
+
+# Read district boundaries
+district_boundary <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp")
+
+# Filter to relevant districts
+district_outline <- district_boundary %>%
+  filter(district %in% c("Gold Fields District", "Sierra District"))
+
+# Prepare and transform main data
+casp_fulldata_monthly4 <- casp_fulldata_monthly %>%
+  filter(district %in% c("Gold Fields District","Sierra District")) %>%
+  st_make_valid() %>%
+  mutate(
+    tick_monthly_presence_z = scale(tick_monthly_presence),
+    flickrgbif_estimatedvisits_z = scale(flickrgbif_estimatedvisits),
+    index_z = tick_monthly_presence_z * flickrgbif_estimatedvisits_z
+  ) %>%
+  filter(!is.na(index_z)) %>%
+  mutate(
+    index_quartile = ntile(index_z, 4),
+    index_cat = factor(index_quartile, levels = 1:4,
+                       labels = c("Low", "Moderate", "High", "Very High"))
+  )
+
+# Calculate centroids
+casp_centroids <- st_centroid(casp_fulldata_monthly4)
+
+# Match CRS
+target_crs <- st_crs(district_outline)
+casp_centroids <- st_transform(casp_centroids, crs = target_crs)
+district_outline <- st_transform(district_outline, crs = target_crs)
+
+# Function to make map for a given month
+make_map <- function(data, month_num, title_month) {
+  data %>%
+    filter(month == month_num) %>%
+    ggplot() +
+    geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 2.5, alpha = 0.9) +
+    geom_sf(data = district_outline, fill = NA, color = "black", size = 0.6) +
+    scale_fill_manual(
+      values = c("Low" = "#3A9AB2", #"#440154FF",
+                 "Moderate" = "#ADC397", #"#3B528BFF",
+                 "High" = "#E5A208", #"#21908CFF",
+                 "Very High" = "#F11B00"), #"#FDE725FF"),
+      name = "Composite Index\n(Quartiles)"
+    ) +
+    labs(title = paste(title_month)) +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      plot.margin = unit(c(0.1, 0.1, 0.1, 0.1), "cm")) 
+}
+
+# Create maps for selected months
+map_ba_1 <- make_map(casp_centroids, 1, "January")
+map_ba_3 <- make_map(casp_centroids, 3, "March")
+map_ba_4 <- make_map(casp_centroids, 4, "April")
+map_ba_5 <- make_map(casp_centroids, 5, "May")
+map_ba_7 <- make_map(casp_centroids, 7, "July")
+map_ba_9 <- make_map(casp_centroids, 9, "September")
+map_ba_10 <- make_map(casp_centroids, 10, "October")
+map_ba_11 <- make_map(casp_centroids, 11, "November")
+
+# Arrange maps in a grid (no titles for consistency)
+library(wesanderson)
+
+temp <- ggarrange(
+  map_ba_1, #+ labs(title = NULL),
+  map_ba_3, #+ labs(title = NULL),
+  map_ba_5, #+ labs(title = NULL),
+  map_ba_7, #+ labs(title = NULL),
+  map_ba_9,
+  map_ba_11,
+  ncol = 3, nrow = 2,
+  common.legend = TRUE, legend = "bottom"
+)
+
+temp_an <- annotate_figure(temp, top = "Bay Area-Sonoma")
+ggsave(temp_an, file = "temp2.png", width = 5, height = 5, dpi = 300, bg = "white")
+
+```
+
+
+try optimizing
+```{r}
+
+temp <- ggarrange(
+  map_ba_1, #+ labs(title = NULL),
+  map_ba_4, #+ labs(title = NULL),
+  map_ba_7, #+ labs(title = NULL),
+  map_ba_10, #+ labs(title = NULL),
+  ncol = 4, nrow = 1,
+  common.legend = TRUE, legend = "bottom"
+)
+
+```

@@ -1,0 +1,1127 @@
+---
+title: "2_Figures"
+output:
+  pdf_document: default
+  html_document: default
+date: "2025-09-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(terra)
+library(tidyverse)
+library(ggplot2)  
+library(scales)
+library(sf)
+library(tigris)
+library(ggspatial)
+library(ggpubr)
+library(cowplot)
+library(patchwork)
+library(ggh4x)
+library(grid)
+library(gridExtra)
+library(png)
+library(ggrepel)
+library(paletteer)
+library(biscale)
+
+ca_shp <- counties(state = "CA", cb = TRUE, class = "sf")
+```
+#Main Text
+
+##Figure 1. Conceptual diagram
+
+part a. People
+```{r}
+## upload population density
+gpw <- rast("data/raw/gpw-v4-population-density-rev11_2020_30_sec_asc/gpw_v4_population_density_rev11_2020_30_sec_1.asc")
+
+# transform to ca crs
+ca_shp_gpw <- ca_shp %>% 
+  st_transform(crs(gpw)) %>% 
+  vect() %>% 
+  {mask(crop(gpw, .), .)} # new trick, make intermediate objects instead of new mask, crops, etc
+#ca_shp_gpw[is.na(ca_shp_gpw)] <- 0 
+gpw_df <- as.data.frame(ca_shp_gpw, xy = TRUE)
+colnames(gpw_df)[3] <- "pop_density"
+
+# to help with log10 transformation
+gpw_df$pop_density <- ifelse(gpw_df$pop_density == 0, 0.001, gpw_df$pop_density)
+
+map_popdensity <- ggplot() +
+  geom_raster(data = gpw_df, aes(x = x, y = y, fill = pop_density)) +
+  geom_sf(data = ca_shp, fill = NA, color = "black", size = 0.6) +
+  scale_fill_viridis_c(trans = "log10", na.value = "grey95", option = "mako", direction = -1,
+                       labels = label_number(accuracy = 0.001, scale_cut = cut_short_scale())) +
+  coord_sf() +
+  theme_void() +
+  labs(title = "PEOPLE", subtitle = "Population Density", fill = "People/km²") + 
+  theme(plot.title = element_text(face = "bold", size = 15), 
+        plot.subtitle = element_text(size = 14),
+        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+        legend.position = "bottom",
+        legend.direction = "horizontal", 
+        legend.key.width = unit(1, "cm"), 
+        legend.key.height = unit(.25, "cm"),
+        legend.title = element_text(size = 14), #vjust = .7, 
+        legend.text = element_text(size = 12),
+        legend.box.spacing = unit(0,"pt")) +
+  guides(fill = guide_colorbar(title.position = "top", title.hjust = 0))
+```
+
+part b. Environment
+```{r}
+tick_inf <- rast("data/raw/ticks/ipac_year_infection_predictions.tif") %>% 
+  project("EPSG:4269") 
+
+
+ca_shp_tick_inf <- ca_shp %>% 
+  st_transform(crs(tick_inf)) %>% 
+  vect() %>% 
+  {mask(crop(tick_inf, .), .)}
+
+tick_inf_df_agg <- aggregate(tick_inf, fact = 5, fun = mean)
+tick_inf_df_agg_df <- as.data.frame(tick_inf_df_agg, xy = TRUE, na.rm = TRUE)
+colnames(tick_inf_df_agg_df)[3] <- "tick_inf"
+tick_inf_df_agg <- aggregate(tick_inf, fact = 5, fun = mean)
+#write.csv(tick_inf_df, file = "tick_inf_df.csv")
+
+map_tickinf <- ggplot() +
+  geom_raster(data = tick_inf_df_agg_df, aes(x = x, y = y, fill = tick_inf)) +
+  geom_sf(data = ca_shp, fill = NA, color = "black", size = 0.6) +
+  scale_fill_viridis_c(na.value = "grey95", option = "mako", direction = -1) +
+  coord_sf() +
+  theme_void() +
+  labs(title = "ENVIRONMENT", subtitle = "Infected Ticks", fill = "Probability") + 
+  theme(plot.title = element_text(face = "bold", size = 15), 
+        plot.subtitle = element_text(size = 14),
+        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+        legend.position = "bottom",
+        legend.direction = "horizontal", 
+        legend.key.width = unit(1, "cm"), 
+        legend.key.height = unit(.25, "cm"),
+        legend.title = element_text(size = 14), #vjust = .7, 
+        legend.text = element_text(size = 12),
+        legend.box.spacing = unit(0,"pt")) +
+  guides(fill = guide_colorbar(title.position = "top", title.hjust = 0))
+
+
+#plot.title = element_text(face = "bold", size = 14), #hjust = 0.5,
+#        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+#        legend.position = "bottom",
+#        legend.direction = "horizontal", 
+#        legend.key.width = unit(1, "cm"), 
+#        legend.title = element_text(vjust = .7))
+```
+
+part c. Exposure
+```{r}
+## fix ca_shp to filter larger shp files
+ca_bbox <- st_bbox(ca_shp) 
+ca_bbox_sf <- st_as_sfc(ca_bbox)
+
+## read in park boundaries
+casp <- st_read("data/raw/parks/casp_individualpark_boundaries/ParkBoundaries.shp") %>% 
+  st_transform(st_crs(ca_shp)) 
+
+us_nps <- st_read("data/raw/parks/nps_boundary/nps_boundary.shp",
+                  wkt_filter = st_as_text(ca_bbox_sf)) %>% # filter to ca before or else it's really slow
+  st_transform(st_crs(ca_shp)) %>% 
+  st_make_valid() %>% 
+  st_intersection(ca_shp)
+
+us_nfs <- st_read("data/raw/parks/nsf_boundary/S_USA.BdyAdm_LSRS_AdministrativeForest.shp",
+                  wkt_filter = st_as_text(ca_bbox_sf)) %>% # filter to ca before or else it's really slow
+  st_transform(st_crs(ca_shp)) %>% 
+  st_make_valid() %>% 
+  st_intersection(ca_shp)   # filter 
+ 
+
+
+## plot it
+
+map_recland <- ggplot() +
+  geom_sf(data = ca_shp, fill = NA, color = "black", size = 0.5) +
+  geom_sf(data = us_nfs, fill = "#008080", aes(color ="NFS"), alpha = 0.9, size = 0.5) +
+  geom_sf(data = us_nps, fill = "goldenrod", aes(color = "NPS"), alpha = 0.9, size = 0.5) +
+  geom_sf(data = casp, fill = "darkred", aes(color ="CASP"), alpha = 0.9, size = 0.5) +
+  
+   annotation_north_arrow(location = "tr", which_north = "true",
+                         height = unit(1.2, "cm"),
+                         width = unit(1.2, "cm"),
+                         pad_x = unit(1.6, "cm")) + #, pad_y = unit(1, "cm") # 2.5 also worked
+  
+  annotation_scale(location = "tr", width_hint = 0.3, text_cex = 0.9,
+                   pad_x = unit(1.6, "cm"), pad_y = unit(2, "cm")) +
+ 
+  scale_color_manual(values = c("CASP" = "darkred",
+                               "NPS" = "goldenrod",
+                               "NFS" = "#008080"), name = "Management") +
+  theme_void() +
+  labs(title = "EXPOSURE", subtitle = "Recreation Land") + 
+  theme(plot.title = element_text(face = "bold", size = 15), 
+        plot.subtitle = element_text(size = 14),
+        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+        legend.position = "bottom",
+        legend.direction = "horizontal", 
+        legend.box = "vertical",
+        legend.title.position = "top",
+        legend.key.width = unit(1, "cm"), 
+        legend.key.height = unit(.25, "cm"),
+        legend.title = element_text(size = 14), #vjust = .7, 
+        legend.text = element_text(size = 12),
+        legend.box.spacing = unit(0,"pt")) +
+  guides(color = guide_legend(title.hjust = 0, direction = "horizontal")) 
+           
+
+
+#plot.title = element_text(face = "bold", size = 14), #hjust = 0.5,
+#        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+#        legend.position = "bottom",
+#        legend.direction = "horizontal", 
+#        legend.key.width = unit(.5, "cm"), 
+#        legend.text = element_text(size = 12),
+#        legend.title = element_text(vjust = .7))
+
+```
+
+Combine them
+```{r}
+map_combo <- ggarrange(map_popdensity, map_tickinf, map_recland,
+          nrow = 1, ncol = 3, 
+          widths = c(1,1,1), align = "hv")
+
+
+
+ggsave(map_combo, file = "figures/fig_1_v3.png", width = 10, height = 7, dpi = 300, bg = "white") # 10 8
+```
+
+##Figure 2. Where
+part a. infected ticks
+```{r}
+
+## set up data
+casp_tick_allextractions <- read.csv(file = "data/processed/casp_tick_allextractions.csv")  %>% 
+  mutate(UNITNAME = case_when(UNITNAME == "Mount Diablo SP - Morgan Territory Regional Preserve" ~ "Mount Diablo SP ",
+                              TRUE ~ UNITNAME))
+
+
+casp_tick_allextractions_shp <- casp_shp_clean  %>% 
+  mutate(UNITNAME = case_when(UNITNAME == "Mount Diablo SP - Morgan Territory Regional Preserve" ~ "Mount Diablo SP ",
+                              TRUE ~ UNITNAME)) %>% 
+  left_join(casp_tick_allextractions, by = "UNITNAME") %>% 
+  st_transform(st_crs(ca_shp)) %>% 
+  st_make_valid() %>% 
+  st_centroid() %>% 
+  mutate(label = UNITNAME,
+         x = st_coordinates(.)[, "X"],
+         y = st_coordinates(.)[, "Y"])   
+
+casp_tick_top10 <- casp_tick_allextractions_shp  %>% 
+  filter(UNITNAME != "Mount Diablo SP - Diablo Foothills Regional Park") %>%  #UNITNAME != "Mount Diablo SP - Morgan Territory Regional Preserve" & 
+  group_by(UNITNAME, x, y, label) %>% 
+  summarise(tick_year_inf_prob = max(tick_year_inf_prob), .groups = "drop") %>% 
+  arrange(desc(tick_year_inf_prob))  %>% 
+  slice_head(n = 10)
+
+map_casptickinf <- 
+  ggplot() +
+  geom_sf(data = ca_shp, fill = "grey40", color = "black") +
+  geom_sf(data = casp_tick_allextractions_shp, aes(color = tick_year_inf_prob), size = 2.5, alpha = .9) +
+  geom_text_repel(data = casp_tick_top10, aes(x = x, y = y, label = label), size = 4.5, 
+                  nudge_x = -7.7, direction = "y", hjust = 1, force = 3.3,box.padding = 0.6,  
+                  segment.color = "gray50", segment.size = 0.3, max.overlaps = 20) +
+  scale_color_paletteer_c("grDevices::YlOrRd", direction = -1, na.value = "transparent")  +
+  theme_void() +
+  labs(title = "Infected Ticks", color = "Probability") + #subtitle = "Top 10 Parks", 
+    theme(plot.title = element_text(face = "bold", size = 15), 
+        #plot.subtitle = element_text(size = 14),
+        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+        legend.position = "bottom",
+        legend.direction = "horizontal", 
+        legend.box = "vertical",
+        legend.title.position = "top",
+        legend.key.width = unit(1, "cm"), 
+        legend.key.height = unit(.25, "cm"),
+        legend.title = element_text(size = 14), #vjust = .7, 
+        legend.text = element_text(size = 12),
+        legend.box.spacing = unit(0,"pt")) +
+  guides(color = guide_colorbar(title.hjust = 0, direction = "horizontal")) 
+  
+ #plot.title = element_text(face = "bold", size = 14), #hjust = 0.5,
+ #      plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+ #      legend.position = "bottom",
+ #      legend.direction = "horizontal", 
+ #      legend.key.width = unit(1, "cm"), 
+ #      legend.title = element_text(vjust = .7))
+
+
+```
+
+part b. Human Activity
+```{r}
+casp_year_total <- read.csv(file = "data/processed/casp_year_totalvisitors.csv")
+
+
+casp_visit_allextractions_shp <- casp_shp_clean  %>% 
+  left_join(casp_year_total, by = "UNITNAME") %>% 
+  st_transform(st_crs(ca_shp)) %>% 
+  st_make_valid() %>% 
+  st_centroid() %>% 
+  mutate(label = UNITNAME,
+         x = st_coordinates(.)[, "X"],
+         y = st_coordinates(.)[, "Y"])   %>% 
+  mutate(casp_year_meantotal = ifelse(is.na(casp_year_meantotal), 1, casp_year_meantotal),
+         casp_year_meantotal = ifelse(is.na(casp_year_meantotal) | casp_year_meantotal == 0, 1, casp_year_meantotal))
+
+
+casp_visit_top10 <- casp_visit_allextractions_shp   %>% 
+  group_by(UNITNAME, x, y, label) %>% 
+  summarise(casp_year_meantotal = max(casp_year_meantotal), .groups = "drop") %>% 
+  arrange(desc(casp_year_meantotal))  %>% 
+  slice_head(n = 13)   %>%  # need to get rid of duplicates
+  group_by(label) %>% 
+  slice(1) %>% 
+  filter(label != "South Carlsbad SB")
+  
+
+map_caspvisits <- 
+ggplot() +
+  geom_sf(data = ca_shp, fill = "grey40", color = "black") +
+  geom_sf(data = casp_visit_allextractions_shp, aes(color = casp_year_meantotal), size = 2.5, alpha = .9) +
+  geom_text_repel(data = casp_visit_top10, aes(x = x, y = y, label = label), size = 4.5, 
+                  nudge_x = -7.5, direction = "y", hjust = 1, force = 4,box.padding = 0.6,  
+                  segment.color = "gray50", segment.size = 0.3, max.overlaps = 20) +
+    scale_color_paletteer_c("grDevices::YlOrRd", direction = -1, na.value = "transparent", trans = "log10", 
+                        labels = label_number(accuracy = 1, scale_cut = cut_short_scale()))  +
+  theme_void() +
+  labs(title = "Annual Visitors", color = "log(Total)") + #subtitle = "Top 10 Parks", 
+    theme(plot.title = element_text(face = "bold", size = 15), 
+        #plot.subtitle = element_text(size = 14),
+        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+        legend.position = "bottom",
+        legend.direction = "horizontal", 
+        legend.box = "vertical",
+        legend.title.position = "top",
+        legend.key.width = unit(1, "cm"), 
+        legend.key.height = unit(.25, "cm"),
+        legend.title = element_text(size = 14), #vjust = .7, 
+        legend.text = element_text(size = 12),
+        legend.box.spacing = unit(0,"pt")) +
+  guides(color = guide_colorbar(title.hjust = 0, direction = "horizontal")) 
+
+
+
+```
+
+combine them
+```{r}
+map_combo_fig2 <- ggarrange(map_casptickinf, map_caspvisits,
+          nrow = 1, ncol = 2,
+          widths = c(2,2), align = "hv")
+
+
+ggsave(map_combo_fig2, file = "figures/fig_2_v3.png", width = 10, height = 7, dpi = 300, bg = "white") # 10 8
+
+
+```
+
+
+##Figure 3. When 
+part a. Biscale figure of parks
+```{r}
+## merge distance with sp data
+min_dist_km <- read.csv("data/processed/casp_dist_coast_km.csv") %>% 
+  dplyr::select(dist_coast_km) %>% #UNITNAME,
+  mutate(#UNITNAME = str_trim(UNITNAME),
+         dist_coast_km = as.numeric(dist_coast_km)) 
+
+# probs should do with _select parks first but will do it this way for now
+casp_shp$dist_coast_km <- min_dist_km$dist_coast_km
+
+casp_shp_dist <- casp_shp %>% # 462 original parks
+  filter(grepl(" SP", UNITNAME) |
+           grepl(" SRA", UNITNAME) |
+           grepl(" SB", UNITNAME) |
+           grepl(" SNR", UNITNAME) |
+           grepl(" SW", UNITNAME))   %>% 
+  st_centroid() %>% 
+  st_transform(crs = st_crs(ca_shp)) %>% 
+  {cbind(., st_coordinates(.))} 
+
+
+## create biscale
+casp_shp_biscale <- bi_class(casp_shp_dist, x = dist_coast_km, y = Y, style = "equal", dim = 3)
+
+biscale_colors <- bi_pal(pal = "DkViolet", dim = 3, preview = FALSE)
+
+## plot
+# base map
+bivar_map <- ggplot() +
+  geom_sf(data = ca_shp, fill = NA, color = "black", size = 0.6) +
+  geom_sf(data = casp_shp_biscale, aes(color = bi_class), size = 2, show.legend = FALSE, alpha = .9) +
+  bi_scale_color(pal = "DkViolet", dim = 3) +
+  bi_theme() +
+  theme_void()
+
+# legend
+bivar_legend <- bi_legend(pal = "DkViolet", dim = 3,
+                          xlab = "Dist. from Coast", ylab = "Rel. Latitude",
+                          pad_width = 0.05, size = 16)
+
+# combin
+map_casp_bivar <-ggdraw() +
+  draw_plot(bivar_map, x = -0.15, y = -0.051, width = 1.3, height = 1.1) +
+  draw_plot(bivar_legend, x = 0.47, y = 0.65, width = 0.39, height = 0.39)# x = 0.46, y = 0.55, width = 0.49, height = 0.49
+  #draw_plot(bivar_legend, 0.4, 0.61, 0.4, 0.4, hjust = -0.3)
+
+
+ggsave(map_casp_bivar, file = "figures/map_casp_bivar_v2.png", dpi = 600, width = 4.2, height = 4)
+```
+
+try with california filled in instead
+```{r}
+# project CA to meters (California Albers)
+ca_m <- st_transform(ca_shp, 3310)
+parks_m     <- st_transform(casp_shp_dist, 3310)
+
+
+# grid resolution (adjust: 10km is a good start)
+grid_m <- st_make_grid(
+  ca_m,
+  cellsize = 10000,
+  square = TRUE
+) |> 
+  st_sf() |> 
+  st_intersection(ca_m)
+
+
+
+grid_centroids <- st_centroid(grid_m)
+nearest_idx <- st_nearest_feature(grid_centroids, parks_m)
+
+grid_m$dist_coast_km <- parks_m$dist_coast_km[nearest_idx]
+
+
+coords <- st_coordinates(grid_centroids)
+grid_m$Y <- coords[,2]
+
+grid_biscale <- bi_class(
+  grid_m,
+  x = dist_coast_km,
+  y = Y,
+  style = "equal",
+  dim = 3
+)
+
+ggplot() +
+  geom_sf(data = grid_biscale, aes(fill = bi_class), color = NA) +
+  geom_sf(data = casp_shp_dist, color = "black", size = 1.3) +
+  geom_sf(data = ca_shp, fill = NA, color = "black", size = 0.4) +
+  bi_scale_fill(pal = "DkViolet", dim = 3) +
+  bi_theme() +
+  theme_void()
+
+grid_m$dist_coast_km <- as.numeric(
+  st_distance(grid_centroids, coast_m) |> 
+    apply(1, min)
+) / 1000
+grid_biscale <- bi_class(
+  grid_m,
+  x = dist_coast_km,
+  y = Y,
+  style = "equal",
+  dim = 3
+)
+bivar_map <- ggplot() +
+  geom_sf(
+    data = grid_biscale,
+    aes(fill = bi_class),
+    color = NA
+  ) +
+  geom_sf(
+    data = casp_shp_dist,
+    color = "black",
+    size = 1.5,
+    alpha = 0.9
+  ) +
+  geom_sf(
+    data = ca_shp,
+    fill = NA,
+    color = "black",
+    size = 0.4
+  ) +
+  bi_scale_fill(pal = "DkViolet", dim = 3) +
+  bi_theme() +
+  theme_void()
+bivar_legend <- bi_legend(
+  pal = "DkViolet",
+  dim = 3,
+  xlab = "Dist. from Coast",
+  ylab = "Rel. Latitude",
+  pad_width = 0.05,
+  size = 16
+)
+
+
+
+### another attempt
+
+ca_sf <- ca_shp %>%
+  st_transform(3310) %>%   # California Albers (meters)
+  st_make_valid()
+grid_m <- st_make_grid(
+  ca_sf,
+  cellsize = 10000,   # 10 km
+  square = TRUE
+) |>
+  st_sf() |>
+  st_intersection(ca_sf)
+grid_centroids <- st_centroid(grid_m)
+# ensure coastline is projected
+coastlines_proj <- coastlines %>%
+  st_transform(3310)
+
+# distance in meters → km
+grid_m$dist_coast_km <- as.numeric(
+  st_distance(grid_centroids, coastlines_proj) |>
+    apply(1, min)
+) / 1000
+coords <- st_coordinates(grid_centroids)
+grid_m$Y <- coords[,2]
+grid_biscale <- bi_class(
+  grid_m,
+  x = dist_coast_km,
+  y = Y,
+  style = "equal",   # or "quantile"
+  dim = 3
+)
+parks_m <- casp_shp_cent_proj %>%
+  st_transform(3310)
+
+library(ggplot2)
+
+bivar_map <- ggplot() +
+  geom_sf(
+    data = grid_biscale,
+    aes(fill = bi_class),
+    color = NA
+  ) +
+  geom_sf(
+    data = parks_m,
+    color = "black",
+    size = 1.3,
+    alpha = 0.9
+  ) +
+  geom_sf(
+    data = ca_sf,
+    fill = NA,
+    color = "black",
+    size = 0.4
+  ) +
+  bi_scale_fill(pal = "DkViolet", dim = 3) +
+  bi_theme() +
+  theme_void()
+
+
+```
+
+part b. Tick seasonality
+```{r}
+
+casp_tick_monthly_suit_long <- read.csv("data/processed/casp_tick_monthly_suit_long.csv")
+
+casp_tick_monthly_suit_distinct <- casp_tick_monthly_suit_long  %>%
+  mutate(month = factor(month, levels = month.abb),
+         month_num = as.numeric(month)) %>% 
+  dplyr::select(UNITNAME, month_num,tick_monthly_suitability) %>% 
+  rename(tick_monthly_presence = tick_monthly_suitability,
+         month = month_num) %>% 
+  distinct(UNITNAME, month, .keep_all = TRUE) 
+
+
+casp_tick_monthly_suit_distinct_sf <- casp_tick_monthly_suit_distinct %>% 
+  left_join(casp_shp_biscale %>% st_drop_geometry() %>% dplyr::select(UNITNAME, bi_class), by = "UNITNAME") 
+
+fig_3_b <- casp_tick_monthly_suit_distinct_sf %>% 
+ggplot(aes(x = as.factor(month), y = tick_monthly_presence)) +
+  geom_boxplot(outlier.shape = NA, fill = "grey95") +
+  geom_jitter(aes(color =  bi_class), alpha = .7, width = 0.1 ) +
+  scale_color_manual(values = biscale_colors) +
+  theme_classic() +
+  scale_x_discrete(labels = month.abb) +
+  guides(color = FALSE) +
+  labs(y = "Tick Habitat Suitability") + # change to suitability
+    theme(#plot.title = element_text(face = "bold", size = 14), #hjust = 0.5,
+        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+        axis.title.y = element_text(face = "bold", size = 18),
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(size = 16),
+        axis.text.y = element_text(size = 16),
+        legend.position = "bottom",
+        legend.direction = "horizontal", 
+        legend.key.width = unit(1, "cm"), 
+        legend.title = element_text(vjust = .7))
+
+```
+
+part c. Human activity
+```{r}
+
+casp_fulldata_monthly_nometa <- st_read("data/processed/casp_fulldata_monthly_nometa.gpkg")
+
+monthly_df_long <- casp_fulldata_monthly_nometa %>% 
+  st_drop_geometry() %>% 
+  mutate(activity_avg = (flickr_monthly_estimatedvisits+gbif_monthly_estimatedvisits/2)) %>% 
+  left_join(casp_shp_biscale %>% st_drop_geometry() %>% dplyr::select(UNITNAME, bi_class), by = "UNITNAME") %>% 
+  pivot_longer(cols = ends_with("_estimatedvisits"),
+               names_to = "source",
+               values_to = "estimatedvisits") %>% 
+  mutate(month = as.numeric(month))
+  
+monthly_df_long$source <- recode(monthly_df_long$source,
+                                 "flickr_monthly_estimatedvisits" = "Flickr",
+                                 "gbif_monthly_estimatedvisits" = "GBIF")
+
+bi_class_levels <- c("1-3", "2-3", "3-3",
+                     "1-2", "2-2", "3-2",
+                     "1-1", "2-1", "3-1")
+
+facet_label <- c("1-3" = "Coastal-North", 
+                 "2-3" = "Mid-North", 
+                 "3-3" = "Inland-North",
+                 "1-2" = "Coastal-Mid", 
+                 "2-2" = "Mid-Mid", 
+                 "3-2" = "Inland-Mid",
+                 "1-1" = "Coastal-South", 
+                 "2-1" = "Mid-South", 
+                 "3-1" ="Inland-South")
+
+biscale_colors <- c(
+  "1-3" = "#4885c1",  
+  "2-3" = "#435786",  
+  "3-3" = "#3f2949" , 
+  "1-2" = "#89a1c8",  
+  "2-2" = "#806a8a",  
+  "3-2" = "#77324c",  
+  "1-1" = "#cabed0",  
+  "2-1" = "#bc7c8f",  
+  "3-1" = "#ae3a4e" )[bi_class_levels] 
+
+
+fig_3_c <- 
+monthly_df_long %>%
+  filter(source != "flickrgbif_estimatedvisits") %>% 
+  mutate(bi_class = factor(bi_class, levels = bi_class_levels)) %>% 
+  ggplot(aes(x = month, fill = source)) +
+  geom_density(aes(weight = estimatedvisits), alpha = 0.5, color = NA, adjust = 1.2) +
+  scale_x_continuous(breaks = 1:12, labels = substr(month.abb, 1, 1), name = "Month", expand = c(0,0.1)) +
+  scale_fill_manual(values = c("Flickr" = "#008080", "GBIF" = "goldenrod")) +
+  theme_classic() +
+  labs(y = "Human Activity", fill = "Data Source") + # Weighted Density
+    theme(#plot.title = element_text(face = "bold", size = 14), #hjust = 0.5,
+        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+        axis.title.y = element_text(face = "bold", size = 18),
+        axis.title.x = element_blank(),
+        axis.text.y = element_text(size = 16),
+        axis.text.x = element_text(size = 16),
+        legend.position = "right",
+        legend.text = element_text(size = 16),
+        legend.direction = "vertical", 
+        legend.key.width = unit(1, "cm"), 
+        legend.title = element_text(vjust = .7, face = "bold", size = 18)) +
+    facet_wrap2(~bi_class, nrow = 3, labeller = labeller(bi_class = facet_label),
+               strip = strip_themed(background_x = elem_list_rect(fill = biscale_colors), 
+                                    text_x = elem_list_text(face = "bold", color = "white", size = 14))) 
+ 
+
+
+```
+
+Combine
+```{r}
+## split into two objects and then combine
+top_row <- plot_grid(map_casp_bivar +  theme(plot.margin = margin(t = 1, r = 2, b = 1, l = 1)), 
+                     fig_3_b, 
+                     ncol = 2, rel_widths = c(.8, 1), 
+                     labels = c("a", "b"), label_size = 16, label_fontface = "bold")
+
+bottom_row <- plot_grid(fig_3_c,  #NULL, fig_3_c, NULL, 
+                        #ncol = 3, rel_widths = c(1, 6.5, 0.4),
+                        labels = "c", label_size = 16, label_fontface = "bold") #c("","c", "")
+
+# Stack with small vertical gap using 'rel_heights' and 'scale'
+final_plot <- plot_grid(top_row, bottom_row,
+                        ncol = 1, rel_heights = c(3.4, 3.3),
+                        align = "v",axis = "lr",
+                        scale = 0.95)   # shrink plots to create smaller gap
+
+ggsave(final_plot, file = "figures/fig_3_v2.png", width = 14, height = 12, bg = "white", dpi = 300)
+
+ggsave(top_row, file = "figures/fig_3top_v1.png", width = 14, height = 6, bg = "white", dpi = 300)
+ggsave(fig_3_c, file = "figures/fig_3bottom_v1.png", width = 16, height = 6, bg = "white", dpi = 300)
+ggsave(bottom_row, file = "figures/fig_3bottom_v1.png", width = 14, height = 6, bg = "white", dpi = 300)
+
+```
+
+
+
+Fig 3 - colors
+```{r}
+"#6B5B93""#88B04B"
+"#457B9D" "#A8DADC"
+"#A8D5BA" "#6C9A6E"
+"#FFB74D" "#6FA3EF"
+"#4A90E2" "#50E3C2"
+"#5E4B8A" "#DAA520"
+c("#DD7867FF", "#B83326FF", "#C8570DFF", "#EDB144FF", "#8CC8BCFF", "#7DA7EAFF", "#5773C0FF", "#1D4497FF")
+
+```
+#Supplemental 
+
+##Supplemental Figure 1. Maps of park adminstrative units
+```{r}
+## create centroids
+casp_shp_select_centroids <- casp_shp_select %>% 
+  st_centroid() %>% 
+  st_transform(crs = st_crs(ca_shp)) %>% 
+  {cbind(., st_coordinates(.))} %>% 
+  filter(Shape_Area > 4800954) # median value
+
+## version 2
+casp_shp_select_centroids2 <- casp_shp_select %>% 
+  st_centroid() %>% 
+  st_transform(crs = st_crs(ca_shp)) %>% 
+  {cbind(., st_coordinates(.))} %>% 
+  filter(Shape_Area > quantile(Shape_Area, 0.90)) %>% # .75 top 25% by area
+  filter(UNITNAME !="Santa Rosa Mountains SW")
+  
+
+
+
+
+map_casp_parks2 <-ggplot() +
+  geom_sf(data = ca_shp, fill = "gray90", color = "gray70", size = 0.1) +
+  geom_sf(data = casp_shp_select, fill =  "forestgreen", color = "forestgreen") +
+  geom_text_repel(
+    data = casp_shp_select_centroids2,
+    aes(x = X, y = Y, label = UNITNAME),
+    size = 3.5,
+    box.padding = 0.5,
+    point.padding = 0.3,
+    force = 1.2,
+    direction = "both",
+    segment.color = "gray50",
+    segment.alpha = 0.5,
+    max.overlaps = Inf #Inf
+  ) +
+  theme_void() +
+  #labs(title = "Select CA State Parks") +
+  theme(plot.title = element_text(face = "bold", size = 16))
+
+ggsave(map_casp_parks2 , file = "figures/fig_s_parkboundary_v4.png",  bg = "white")#width = 12, height = 15,
+```
+
+
+##Supplemental Figure 2. Park Admin boundaries
+```{r}
+## Field Division (n = 4)
+map_casp_fielddivision <-  ggplot() +
+    geom_sf(data = ca_shp, fill = NA, color = "gray50", size = 0.1) +
+    geom_sf(data = casp_districtdivision_shp, aes(fill = field_divi), color = "black", alpha = 0.8) +
+    theme_void() +
+  labs(fill = "Field Division") +
+  theme(legend.title = element_text(face = "bold")) +
+  scale_fill_manual(values = c("#8CC8BCFF", "#EDB144FF","#C8570DFF",  "#7DA7EAFF"))
+
+## District (n = 21)
+base_palette <- paletteer_d("ggthemes::manyeys", n = 19)$colors
+extended_palette <- c(base_palette,"#F4C2C2","#F0E5D8")#,"#F9D5B1")# "#E3CFC4" , "beige") #"#7F3C8D"
+
+map_casp_district <-  
+ggplot() +
+    geom_sf(data = ca_shp, fill = NA, color = "gray50", size = 0.1) +
+    geom_sf(data = casp_districtdivision_shp, aes(fill = district), color = "black", alpha = 0.8) +
+    theme_void() +
+  labs(fill = "District") +
+  theme(legend.title = element_text(face = "bold")) +
+  scale_fill_manual(values = extended_palette ) #+guides(fill = guide_legend(ncol = 1))
+#legend_only <- get_legend(map_casp_district)
+#png("map_casp_district_legend.png", width = 690, height = 1600, res = 300) # adjust size as needed
+#grid::grid.draw(legend_only)
+#dev.off()
+
+
+## combine park admin
+fig_s_parkadmin_boundary <- ggarrange(map_casp_fielddivision + labs(tag = "a"),map_casp_district+ labs(tag = "b"), 
+                                      
+                                      nrow = 2, ncol = 1, align = "hv", 
+                                      widths = c(1,2), heights = c(.9,1) )
+#ggsave(fig_s_parkadmin_boundary, file = "figures/fig_s_parkadmin_boundary.png", width = 6, height = 5.7, bg = "white")
+
+
+ggsave(map_casp_fielddivision, file = "figures/fig_s_fielddivision.png", width = 6, height = 5.7, bg = "white")
+ggsave(map_casp_district, file = "figures/fig_s_district.png", width = 6, height = 5.7,bg = "white")
+```
+
+
+##Supplemental Figure 4. LDI per zip code
+
+part A. LD incidence
+```{r}
+
+ldi2 <- st_read("data/raw/LD_incidence/CA_Zips_Lyme_NAD83.shp") %>% 
+  st_make_valid()
+
+ldi2$LDI_Cat <- factor(ldi2$LDI_Cat, levels = sort(unique(ldi2$LDI_Cat))) 
+  
+ldi2 <- ldi2 %>% 
+  mutate(LDI_Cat_Intervals = factor(LDI_Cat,
+                                       levels = c(0, 1, 5, 10, 20, 50, 100),
+                                       labels = c("0", "0.01 - 1.0", "1.01 -5.0", "5.1 -10.0",
+                                                  "10.01 - 20.0", "20.01 - 50.0", ">50.0")))
+map_ldi_zip <- 
+  ggplot() +
+  geom_sf(data = ldi2, aes(fill = LDI_Cat_Intervals), color = NA, size = 0.1) +
+  scale_fill_viridis_d(option = "H", direction = 1, na.value = "grey90", name = "Lyme \nDisease\nIncidence") + 
+  #labs(tag = "A") +
+  theme_void() +
+    theme(plot.title = element_text(face = "bold", size = 14), #hjust = 0.5,
+        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+        legend.position = "right",#"bottom",# 
+        legend.direction = "vertical", #"horizontal",# 
+        #legend.key.width = unit(.25, "cm"), 
+        #legend.key.height = unit(.25, "cm"),
+        legend.title = element_text(vjust = .7,face = "bold")) +
+  guides(fill = guide_legend(reverse = TRUE))
+
+ggsave(map_ldi_zip, file = "figures/fig_s_ldizip_v2.png", bg = "white")
+```
+part B. tick suitability
+```{r}
+
+tick_inf <- rast("data/raw/ticks/ipac_year_infection_predictions.tif") %>% 
+  project("EPSG:4269") 
+
+ldi <- st_read("data/raw/LD_incidence/CA_Zips_Lyme_NAD83.shp") 
+
+ca_zipcode_shp <- ldi %>% 
+  st_transform(st_crs(ca_shp)) %>% 
+  dplyr::select(ZIP_CODE,PO_NAME, geometry, LDI_Cat)
+  #dplyr::select(ZIP_CODE, PO_NAME, LDI_Cat,  GEOID, NAME)
+
+
+zipcode_tick_df <- read.csv(file = "data/processed/zipcode_tickinf.csv") %>% 
+  mutate(ZIP_CODE = as.character(ZIP_CODE),
+         ZIP_CODE = str_pad(ZIP_CODE, width = 5, side = "left", pad = "0")) %>% 
+  dplyr::select(-X) 
+  
+
+zipcode_tick_shp <- ca_zipcode_shp %>% 
+  left_join(zipcode_tick_df, by = "ZIP_CODE")
+  
+map_inftick_zip <-ggplot() +
+  geom_sf(data = zipcode_tick_shp, aes(fill = tick_year_inf_prob), color = NA, size = 0.1) +
+  scale_fill_viridis_c(option = "H", direction = 1, na.value = "grey90", name = "Infected \nTick\nSuitability") + 
+  #labs(tag = "B") +
+  theme_void() +
+    theme(plot.title = element_text(face = "bold", size = 14), #hjust = 0.5,
+        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+        legend.position = "right",#"bottom",# 
+        legend.direction = "vertical", #"horizontal",# 
+        #legend.key.width = unit(.25, "cm"), 
+        #legend.key.height = unit(.25, "cm"),
+        legend.title = element_text(vjust = .7,face = "bold")) 
+```
+
+part c. human activity
+```{r}
+
+zipcode_fulldata_annual <- st_read("data/processed/zipcode_fulldata_annual.gpkg")
+
+
+map_humanactiv_zip <-ggplot() +
+  geom_sf(data = zipcode_fulldata_annual, aes(fill = log(meta_activity+1)), color = NA, size = 0.1) +
+  scale_fill_viridis_c(option = "H", direction = 1, na.value = "grey90", name = "Relative \nHuman\nActivity") + 
+  #labs(tag = "C") +
+  theme_void() +
+    theme(plot.title = element_text(face = "bold", size = 14), #hjust = 0.5,
+        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+        legend.position = "right",#"bottom",# 
+        legend.direction = "vertical", #"horizontal",# 
+        #legend.key.width = unit(.25, "cm"), 
+        #legend.key.height = unit(.25, "cm"),
+        legend.title = element_text(vjust = .7,face = "bold")) 
+```
+
+combine them
+```{r}
+
+map_combo_sf3 <- ggarrange(map_ldi_zip , 
+                           map_inftick_zip , 
+                           map_humanactiv_zip , 
+                           ncol = 1, nrow = 3)
+
+ggsave(map_combo_sf3, file = "figures/map_combo_sf3_v2.png", width = 6, bg = "white", dpi = 300)
+
+
+map_combo_sf3v2 <- ggarrange(map_ldi_zip + theme(legend.position = "right",
+                                                                 legend.direction = "vertical")
+                             ,map_inftick_zip + theme(legend.position = "right",
+                                                                 legend.direction = "vertical"),
+                             map_humanactiv_zip + theme(legend.position = "right",
+                                                                 legend.direction = "vertical"),
+                             ncol = 1, nrow = 3)
+ggsave(map_combo_sf3v2, file = "figures/map_combo_sf3_v3.png",  bg = "white", dpi = 300)#width = 6, height = 10,
+
+   
+```
+
+
+
+##Supplemental Figure 4. Maps of tick suitability predictions
+```{r}
+## write function to call in all tiff files
+tick_month_tiff <- list.files("data/raw/ticks/ipac_month_suitability_predictions/", full.names = TRUE)
+month_names <- month.abb[1:length(tick_month_tiff)]
+
+## fix park crs
+sample_rast <- rast(tick_month_tiff[1])
+
+casp_shp_vect_suit_monthly <- casp_shp_clean %>% 
+  st_make_valid() %>% 
+  st_simplify(dTolerance = 0.001, preserveTopology = TRUE) %>% 
+  st_transform(crs = crs(sample_rast)) %>% 
+  vect()
+
+
+## define plotting function
+plot_tick_suitability <- function(tif_path, month_label, shp_vect) {
+  rast_month <- rast(tif_path)
+  
+  # aggregate for mmory 
+  
+  rast_month <- aggregate(rast_month, fact = 5, fun = mean)
+  
+  # convert to df for ggplot
+  df <- as.data.frame(rast_month, xy = TRUE, na.rm = FALSE)
+  names(df)[3] <- "tick_inf"
+  
+  # convert to sf for plotting 
+  shp_sf <- st_as_sf(shp_vect)
+  
+  ggplot() +
+    geom_raster(data = df, aes(x = x, y = y, fill = tick_inf)) +
+    geom_sf(data = shp_sf, fill = "tomato", color = "tomato", size = 0.6) +
+    #geom_sf(data = shp_sf, fill = NA, color = "black", size = 0.6) +
+    scale_fill_viridis_c(na.value = "grey95", option = "mako", direction = -1) +
+    coord_sf() +
+    theme_void() +
+    labs(title =  month_label, fill = "Probability") +
+    theme(plot.title = element_text(face = "bold", size = 20),
+      plot.margin = margin(t = 0, r = 0, b = 0, l = 0),
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.key.width = unit(1, "cm"),
+      legend.title = element_text(vjust = .7)) +
+    guides(fill = FALSE)
+}
+
+
+# generate a list of plots
+tick_monthly_plots <- map2(.x = tick_month_tiff,
+                           .y = month_names,
+                           .f = ~plot_tick_suitability(.x, .y, shp_vect = casp_shp_vect_suit_monthly))
+
+
+# make grid layout
+wrap_plots(tick_monthly_plots, ncol = 4) +
+  plot_annotation(title = "Monthly Environmental Suitability for Ticks")
+
+dir.create("figures/monthly_maps_v3", showWarnings = FALSE)
+for (i in seq_along(tick_month_tiff)) {
+  plot_i <- plot_tick_suitability(tif_path = tick_month_tiff[i],
+                                  month_label = month_names[i],
+                                  shp_vect = casp_shp_vect_suit_monthly)
+  
+  ggsave(filename = paste0("figures/monthly_maps_v3/", month_names[i], ".png"),
+    plot = plot_i, width = 6,height = 5, dpi = 150)
+  
+  rm(plot_i)
+  gc()
+}
+
+```
+
+arrange
+```{r}
+library(magick)
+library(cowplot)
+library(grid)
+
+# Get PNG paths
+img_paths <- list.files(
+  "figures/monthly_maps_v3",
+  pattern = "\\.png$",
+  full.names = TRUE
+)
+
+# Optional: sort by month
+img_paths <- img_paths[
+  match(month.abb, tools::file_path_sans_ext(basename(img_paths)))
+]
+
+# Read + aggressively trim
+plots <- lapply(img_paths, function(p) {
+  img <- image_read(p) |>
+    image_trim(fuzz = 40)   # trims transparent + near-white margins
+
+  ggdraw() +
+    draw_image(img,  scale = 1)
+})
+
+monthly_grid <- plot_grid(
+  plotlist = plots,
+  ncol = 4,
+  align = "hv"
+)
+
+final_plot <- plot_grid(
+  ggdraw() +
+    draw_label(
+      "Tick Suitability by Month",
+      fontface = "bold",
+      size = 18,
+      x = 0.5,
+      hjust = 0.5
+    ),
+  monthly_grid,
+  ncol = 1,
+  rel_heights = c(0.08, 1)
+)
+
+ggsave(
+  "monthly_maps_grid_v4.png",
+  final_plot,
+  width  = 12,   # flexible
+  height = 9,    # flexible
+  dpi = 300,
+  bg = "white"
+)
+
+
+
+```
+
+arrange(old way)
+```{r}
+
+
+# Step 1: Get paths to your PNGs
+img_paths <- list.files("figures/monthly_maps_v3", pattern = "\\.png$", full.names = TRUE)
+
+# Optional: sort by month if needed
+img_paths <- img_paths[match(month.abb, tools::file_path_sans_ext(basename(img_paths)))]
+
+# Step 2: Read images into grobs
+img_grobs <- lapply(img_paths, function(path) {
+  img <- readPNG(path)
+  rasterGrob(img, interpolate = TRUE)
+})
+
+# Step 3: Arrange in grid 
+grid_arrange_shared <- marrangeGrob(grobs = img_grobs, nrow = 3, ncol = 4, rel_widths = rep(1, 4),
+  rel_heights = rep(1, 3),
+  labels = NULL,
+  label_size = 0,top = "Tick Suitability by Month")
+
+#png("figures/fig_s_tickpresence_monthly_v2.png", res = 300, width = 10, height = 10, units = "in")
+#grid.draw(grid_arrange_shared)
+#dev.off()
+
+```
+
+combine them
+```{r}
+
+# Step 1: Get PNG paths
+img_paths <- list.files("figures/monthly_maps_v2", pattern = "\\.png$", full.names = TRUE)
+
+# Ensure they are ordered by month (Jan–Dec)
+img_paths <- img_paths[match(month.abb, tools::file_path_sans_ext(basename(img_paths)))]
+
+# Step 2: Convert PNGs to grobs wrapped in ggplot objects
+img_ggplots <- lapply(img_paths, function(path) {
+  img <- readPNG(path)
+  g <- rasterGrob(img, interpolate = TRUE)
+  
+  # Wrap into a ggplot
+  ggplot() +
+    annotation_custom(g, xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf) +
+    theme_void()
+})
+
+# Step 3: Use ggarrange for more layout control
+final_plot <- ggarrange(
+  plotlist = img_ggplots,
+  ncol = 4, nrow = 3,
+  align = "hv",
+  #labels = month.abb,
+  label.font = list(size = 14, face = "bold"),
+  label.x = 0.1, label.y = 0.9,
+  hjust = 0, vjust = 1
+)
+
+
+```
+
+##Supplemental Figure 6. Map of suitable predictions by park district
+
+```{r}
+casp_tick_monthly_suit_long <- read.csv("data/processed/casp_tick_monthly_suit_long.csv")
+
+casp_tick_monthly_suit_distinct <- casp_tick_monthly_suit_long  %>%
+  mutate(month = factor(month, levels = month.abb),
+         month_num = as.numeric(month)) %>% 
+  dplyr::select(UNITNAME, month_num,tick_monthly_suitability) %>% 
+  rename(tick_monthly_presence = tick_monthly_suitability,
+         month = month_num) %>% 
+  distinct(UNITNAME, month, .keep_all = TRUE) 
+
+casp_tick_monthly_suit_distinct_df <- casp_shp_clean %>% 
+  left_join(casp_tick_monthly_suit_distinct , by = "UNITNAME") %>% 
+  st_drop_geometry()
+
+
+ticksuit_distdivi_boxplot <- casp_tick_monthly_suit_distinct_df %>% 
+  mutate(field_divi = case_when(field_divi == "Northern Field Division" ~ "Northern Field Division",
+                                field_divi == "Nothern Field Division" ~ "Northern Field Division",
+                                TRUE ~ field_divi)) %>% 
+  ggplot(aes(x = as.factor(month), y = tick_monthly_presence)) +
+  geom_boxplot(outlier.shape = NA, fill = "grey95") +
+  geom_jitter( aes(color = district), alpha = 0.7, width = 0.1) +
+  #facet_wrap(~field_divi, ncol = 1) +
+  theme_classic() +
+  labs(y = "Tick Habitat Suitability", color = "District") +
+  scale_x_discrete(labels = month.abb) +
+    theme(plot.title = element_text(face = "bold", size = 14), #hjust = 0.5,
+        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+        axis.title.y = element_text(face = "bold", size = 18),
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(size = 16),
+        axis.text.y = element_text(size = 16),
+        legend.position = "bottom",
+        legend.direction = "horizontal", 
+        legend.key.width = unit(1, "cm"), 
+        legend.title = element_text(vjust = .7)) +
+  scale_color_manual(values = extended_palette ) +
+  guides(color = FALSE) +
+    facet_wrap2(~field_divi, ncol = 1, #labeller = labeller(bi_class = facet_label),
+               strip = strip_themed(background_x = elem_list_rect(fill = c("#8CC8BCFF", "#EDB144FF","#C8570DFF",  "#7DA7EAFF")), 
+                                    text_x = elem_list_text(face = "bold", color = "white", size = 14)))
+
+## need ot figure out how to remove legend
+ggsave(ticksuit_distdivi_boxplot, file = "figures/fig_s_ticksuit_distdiv_v2.png", width = 6, height = 11)
+
+```

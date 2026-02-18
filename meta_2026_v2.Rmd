@@ -1,0 +1,255 @@
+---
+title: "Untitled"
+output: html_document
+date: "2026-01-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+library(googledrive)
+library(data.table)
+library(dplyr)
+library(sf)
+library(terra)
+library(lubridate)
+library(purrr)
+library(stringr)
+library(tmap)
+
+# -----------------------------
+# 1. Parameters
+# -----------------------------
+drive_auth(cache = FALSE, scopes = "https://www.googleapis.com/auth/drive")
+# Google Drive folder
+folder_id <- "1bIdZiuj5GOXgti4_DE-Qs9cvp9voL0vj"
+
+# Temp folder with enough space
+csv_temp_dir <- "D:/meta_csvs"
+dir.create(csv_temp_dir, recursive = TRUE, showWarnings = FALSE)
+
+# California bounding box
+lat_min <- 32.3
+lat_max <- 42.1
+lon_min <- -125
+lon_max <- -114
+
+# Tile zoom level
+zoom <- 13
+
+# GPW population raster
+gpw_path <- "data/raw/humanpop_count/gpw_v4_population_count_rev11_2015_2pt5_min.tif"
+gpw <- rast(gpw_path)
+
+# Output folder for processed tile shapefiles
+output_folder <- "data/processed/ca_activity_tiles"
+dir.create(output_folder, recursive = TRUE, showWarnings = FALSE)
+
+# -----------------------------
+# 2. Helper functions
+# -----------------------------
+
+# Convert lon/lat to tile numbers
+lonlat_to_tile <- function(lon, lat, zoom) {
+  n <- 2^zoom
+  xtile <- floor((lon + 180) / 360 * n)
+  ytile <- floor((1 - log(tan(lat*pi/180) + 1/cos(lat*pi/180))/pi)/2 * n)
+  list(x = xtile, y = ytile)
+}
+
+# Convert tile numbers to bounding box in lon/lat
+tile_to_bbox <- function(xtile, ytile, zoom) {
+  n <- 2^zoom
+  lon_min <- xtile / n * 360 - 180
+  lon_max <- (xtile + 1) / n * 360 - 180
+  lat_rad <- function(y) atan(sinh(pi*(1 - 2*y/n)))
+  lat_min <- lat_rad(ytile + 1) * 180 / pi
+  lat_max <- lat_rad(ytile) * 180 / pi
+  list(xmin = lon_min, xmax = lon_max, ymin = lat_min, ymax = lat_max)
+}
+
+# -----------------------------
+# 3. CSV processing function
+# -----------------------------
+
+process_csv_file_by_record <- function(csv_path) {
+  
+  message("Reading CSV: ", csv_path)
+  
+  # Read CSV in chunks if needed (here reading full CSV)
+  dt <- fread(csv_path)
+  
+  # Filter to California & daytime
+  dt <- dt %>%
+    filter(
+      visit_latitude >= lat_min & visit_latitude <= lat_max,
+      visit_longitude >= lon_min & visit_longitude <= lon_max,
+      day_or_night == "daytime"
+    )
+  
+  if(nrow(dt) == 0) {
+    message("No CA daytime records in this file.")
+    return(NULL)
+  }
+  
+  # Round home coordinates
+  dt <- dt %>% 
+    mutate(
+      home_lat_round = round(home_latitude, 5),
+      home_lon_round = round(home_longitude, 5)
+    )
+  
+  # Extract home population
+  home_sf <- dt %>% 
+    distinct(home_lat_round, home_lon_round) %>% 
+    st_as_sf(coords = c("home_lon_round", "home_lat_round"), crs = 4326)
+  
+  # Project to GPW raster CRS and keep rounded coordinates
+home_sf_proj <- st_transform(home_sf, crs(gpw)) %>% 
+  mutate(
+    home_lon_round = st_coordinates(.)[,1],
+    home_lat_round = st_coordinates(.)[,2]
+  )
+
+# Extract population counts
+home_sf_proj$home_population <- terra::extract(gpw, vect(home_sf_proj))[,2]
+home_df <- st_drop_geometry(home_sf_proj)
+
+  home_pop <- terra::extract(gpw, vect(home_sf))[,2]
+  home_sf$home_population <- ifelse(is.na(home_pop), 0, home_pop)
+  
+  dt <- dt %>%
+    left_join(home_df,
+      #st_drop_geometry(home_sf),
+      by = c("home_lat_round", "home_lon_round")
+    ) %>%
+    mutate(home_population = ifelse(is.na(home_population), 0, home_population),
+           weighted_activity = home_population * visit_fraction)
+  
+  # -----------------------------
+  # 3a. Gridded by 3-week record
+  # -----------------------------
+  
+  dt <- dt %>%
+    mutate(
+      record_start = as.Date(ds),  # assuming 'ds' is start date of 3-week record
+      record_week = ceiling((yday(record_start) %% 365) / 21)  # 3-week bins in year
+    )
+  
+  # Aggregate by visit pixel + record
+  activity_summary <- dt %>%
+    mutate(
+      visit_lat_round = round(visit_latitude, 5),
+      visit_lon_round = round(visit_longitude, 5)
+    ) %>%
+    group_by(visit_lat_round, visit_lon_round, record_start) %>%
+    summarise(
+      total_weighted_activity = sum(weighted_activity, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # -----------------------------
+  # 3b. Convert to tiles
+  # -----------------------------
+  
+  tile_df <- activity_summary %>%
+    rowwise() %>%
+    mutate(tile = list(lonlat_to_tile(visit_lon_round, visit_lat_round, zoom))) %>%
+    mutate(xtile = tile$x, ytile = tile$y) %>%
+    ungroup()
+  
+  tile_activity <- tile_df %>%
+    group_by(xtile, ytile, record_start) %>%
+    summarise(activity = sum(total_weighted_activity, na.rm = TRUE), .groups = "drop")
+  
+  # -----------------------------
+  # 3c. Build polygons
+  # -----------------------------
+  
+  polygon_list <- purrr::pmap(
+    list(tile_activity$xtile, tile_activity$ytile),
+    function(x, y) {
+      bb <- tile_to_bbox(x, y, zoom)
+      st_polygon(list(matrix(c(
+        bb$xmin, bb$ymin,
+        bb$xmax, bb$ymin,
+        bb$xmax, bb$ymax,
+        bb$xmin, bb$ymax,
+        bb$xmin, bb$ymin
+      ), ncol = 2, byrow = TRUE)))
+    }
+  )
+  
+  tile_activity_sf <- st_sf(
+    tile_activity,
+    geometry = st_sfc(polygon_list, crs = 4326)
+  )
+  
+  return(tile_activity_sf)
+}
+
+```
+
+
+loop
+```{r}
+# Get CSV list from Google Drive
+folder <- drive_get(as_id(folder_id))
+csv_files <- drive_ls(folder, pattern = "\\.csv$")
+csv_files$name <- str_replace_all(csv_files$name, "[[:space:]]+", "_")
+
+for(i in seq_len(nrow(csv_files))) {
+  csv_id <- csv_files$id[i]
+  csv_name <- csv_files$name[i]
+  local_file <- file.path(csv_temp_dir, csv_name)
+  
+  # Download
+  message("Downloading: ", csv_name)
+  drive_download(as_id(csv_id), path = local_file, overwrite = TRUE)
+  
+  # Process
+  tile_sf <- process_csv_file_by_record(local_file)
+  
+  if(!is.null(tile_sf)) {
+    out_file <- file.path(output_folder, paste0(tools::file_path_sans_ext(csv_name), "_tiles.shp"))
+    st_write(tile_sf, out_file, delete_layer = TRUE)
+  }
+  
+  # Delete CSV to free space
+  file.remove(local_file)
+  gc()
+}
+
+
+
+```
+
+
+now combine the shapefiles
+```{r}
+tile_files <- list.files(output_folder, pattern = "\\.shp$", full.names = TRUE)
+all_tiles_sf <- map(tile_files, st_read) %>% bind_rows()
+
+# Optional: aggregate by record_start + tile if you want cumulative activity
+agg_tiles <- all_tiles_sf %>%
+  group_by(xtile, ytile, record_start) %>%
+  summarise(activity = sum(activity, na.rm = TRUE), .groups = "drop")
+
+
+
+```
+
+visualize
+```{r}
+
+library(leaflet)
+pal <- colorNumeric("YlOrRd", domain = log(agg_tiles$activity+1))
+
+leaflet(agg_tiles) %>%
+  addTiles() %>%
+  addPolygons(fillColor = ~pal(log(activity+1)), weight = 0.5, color = "black", fillOpacity = 0.7)
+
+```

@@ -1,0 +1,445 @@
+---
+title: "meta 2026 v3 working??"
+output: html_document
+date: "2026-01-27"
+---
+
+work flow
+1. set up google drive access & file paths
+2. define helper functions
+3. define csv processing function
+4. loop over all csv
+5. combine & save tiles
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## upload necessary packages
+library(googledrive)
+library(data.table)
+library(dplyr)
+library(sf)
+library(terra)
+library(lubridate)
+library(purrr)
+library(stringr)
+library(tmap)
+library(arrow)
+library(exactextractr)
+
+## set up parameters
+# CA bounding box
+lat_min <- 32.3
+lat_max <- 42.1
+lon_min <- -125
+lon_max <- -114
+
+# tile zoom level
+zoom <- 13
+
+# population raster from GPW (others will have to change path)
+gpw_path <- "data/raw/humanpop_count/gpw_v4_population_count_rev11_2015_2pt5_min.tif"
+gpw <- rast(gpw_path)
+
+```
+
+##step 1. set up google drive permissions/file paths
+```{r}
+## authenticates session (will pop up in browser)
+drive_auth(cache = FALSE, scopes = "https://www.googleapis.com/auth/drive")
+
+# my specific google drive folder (others will need to change)
+folder_id <- "1bIdZiuj5GOXgti4_DE-Qs9cvp9voL0vj"
+
+# create temp folder for csv downloads
+csv_temp_dir <- "D:/meta_csvs"
+dir.create(csv_temp_dir, recursive = TRUE, showWarnings = FALSE)
+
+
+# create output folder for processed tiles (per-csv) 
+output_folder <- "data/processed/ca_activity_tiles"
+dir.create(output_folder, recursive = TRUE, showWarnings = FALSE)
+```
+
+##step 2. write helper functions
+```{r}
+#### function 1
+## meta gave lat/lon but need to put these into tiles for visitation/aggregation
+# convert lon/lat to tile numbers (formula comes from slippy map tiling)
+# Web mercator tile indicies
+lonlat_to_tile <- function(lon, lat, zoom) {
+  n <- 2^zoom
+  xtile <- floor((lon + 180) / 360 * n)
+  ytile <- floor((1 - log(tan(lat*pi/180) + 1/cos(lat*pi/180))/pi)/2 * n)
+  list(x = xtile, y = ytile)
+  }
+
+#### function 2
+# convert tile numbers to bounding box in lon/lat
+# (need to do this to create polyfons for sf objects)
+tile_to_bbox <- function(xtile, ytile, zoom) {
+  n <- 2^zoom
+  lon_min <- xtile / n * 360-180
+  lon_max <- (xtile + 1) / n * 360 - 180
+  lat_rad <- function(y) atan(sinh(pi*(1 - 2*y/n)))
+  lat_min <- lat_rad(ytile + 1) * 180 / pi
+  lat_max <- lat_rad(ytile) * 180 / pi
+  list(xmin = lon_min, xmax = lon_max, ymin = lat_min, ymax = lat_max)
+  }
+
+```
+
+##step 3. write csv processing function
+- filter for CA & daytime activity
+- round home coordinates to reduce duplicates
+- extract population at each home location (w/ GPW raster)
+- calculate population weighted activity (home pop x visit fract)
+- aggregate weighted activity by 3-week period (per csv)
+- convert visit points to tiles with weighted activity values
+- create polygons for each tile and attach weighted activity values
+- return sf collection of tile polygons with activity per 3wk record
+```{r}
+## i am processing 1 csv at a time to not blow up my computer
+# (by 'record' i mean individual csv in Gdrive)
+
+process_csv_file_by_record <- function(csv_path) {
+  message("Reading csv: ", csv_path)
+  dt <- fread(csv_path) # reads csv into memory
+  
+  ## filter to CA & daytime visits
+  dt <- dt %>% 
+    filter(visit_latitude >= lat_min & visit_latitude <= lat_max,
+           visit_longitude >= lon_min & visit_longitude <= lon_max,
+           day_or_night == "daytime") # would change this for heat xtreme project
+  
+  if(nrow(dt) == 0) {
+    message("no ca daytime records in this file")
+    return(NULL)}
+  
+  ## round home coords to reduce duplicates/easier raster lookjups
+  dt <- dt %>% 
+    mutate(home_lat_round = round(home_latitude, 5), # ~ 1m precision
+           home_lon_round = round(home_longitude, 5))
+  
+  ## extract home population 
+  home_sf <- dt %>% 
+    distinct(home_lat_round, home_lon_round) %>% # extract only 1 home location
+    st_as_sf(coords = c("home_lon_round", "home_lat_round"), crs = 4326) 
+  
+  home_sf_proj <- st_transform(home_sf, crs(gpw)) %>% # make sure crs the same
+    mutate(home_lon_round = st_coordinates(.)[,1],
+           home_lat_round = st_coordinates(.)[,2])
+  
+  # extract population counts per home location
+  home_sf_proj$home_population <- terra::extract(gpw, vect(home_sf_proj))[,2] 
+  home_df <- st_drop_geometry(home_sf_proj) # make plain data frame for joining
+  
+  # join home pop back to original visits & create pop-weighted activity
+  dt <- dt %>% 
+    left_join(home_df, by = c("home_lat_round", "home_lon_round")) %>% 
+    mutate(home_population = ifelse(is.na(home_population), 0, home_population),
+           weighted_activity = home_population * visit_fraction)
+  
+  
+  ### 3a. aggregate grid by 3-week record (1 csv observation)
+  dt <- dt %>% 
+    mutate(record_start = as.Date(ds), # meta calls ds = date
+           record_week = ceiling((yday(record_start) %% 365) / 21)) #3wk bins
+  
+  # aggregate by visit pixel by record/csv
+  activity_summary <- dt %>% 
+    mutate(visit_lat_round = round(visit_latitude, 5),
+           visit_lon_round = round(visit_longitude, 5)) %>% 
+    group_by(visit_lat_round, visit_lon_round, record_start) %>% 
+    summarise(total_weighted_activity = sum(weighted_activity, na.rm = TRUE), .groups = "drop")
+  
+  ### 3b. convert to tiles
+  # convert visit coords to tile indices
+  tile_df <- activity_summary %>% 
+    rowwise() %>% 
+    mutate(tile = list(lonlat_to_tile(visit_lon_round, visit_lat_round, zoom))) %>% 
+    mutate(xtile = tile$x, ytile = tile$y) %>% 
+    ungroup()
+  
+  # aggregate all pixel activity within the same tile and record/csv
+  tile_activity <- tile_df %>% 
+    group_by(xtile, ytile, record_start) %>% 
+    summarise(activity = sum(total_weighted_activity, na.rm = TRUE, .groups = "drop"))
+  
+  ### 3c. build polygons for each tile
+  polygon_list <- purrr::pmap(
+    list(tile_activity$xtile, tile_activity$ytile),
+    function(x, y) {
+      bb <- tile_to_bbox(x, y , zoom)
+      st_polygon(list(matrix(c(bb$xmin, bb$ymin,
+                               bb$xmax, bb$ymin,
+                               bb$xmax, bb$ymax,
+                               bb$xmin, bb$ymax,
+                               bb$xmin, bb$ymin),
+                             ncol = 2, byrow = TRUE)))})
+  
+  # combine tile indices, activity value and geometry and return SF object 
+  tile_activity_sf <- st_sf(tile_activity, geometry = st_sf(polygon_list, crs = 4326))
+  
+  return(tile_activity_sf)
+  
+ }
+
+```
+
+##step 4. loop over csvs
+```{r}
+# list all csvs in Gdrive
+folder <- drive_get(as_id(folder_id))
+csv_files <- drive_ls(folder, pattern = "\\.csv$")
+# fix file names meta gave me bc they break my code w/ all the spaces
+csv_files$name <- str_replace_all(csv_files$name, "[[:space:]]+", "_") 
+
+# download 1 csv at a time to avoid memory issues
+for(i in seq_len(nrow(csv_files))) {
+  csv_id <- csv_files$id[i]
+  csv_name <- csv_files$name[i]
+  local_file <- file.path(csv_temp_dir, csv_name)
+  
+  # make it check
+  message("downloading: ", csv_name)
+  drive_download(as_id(csv_id), path = local_file, overwrite = TRUE)
+  
+  # process each csv per record/3wk tile
+  tile_sf <- process_csv_file_by_record(local_file)
+  
+  # saves 1 shapefile per csv (there's about ~ 148 csv) - i would do this differentlty next time
+  if(!is.null(title_sf)) {
+    out_file <- file.path(output_folder, paste0(tools::file_path_sans_ext(csv_name), "_tiles.shp"))
+    st_write(tile_sf, out_file, delete_layer = TRUE)}
+  
+  # deletes csv and runs gc to keep disk usage low
+  file.remove(local_file)
+  gc()
+  
+}
+
+```
+
+##step 5. save files
+```{r}
+# format it
+tile_files <- list.files(output_folder, pattern = "\\.shp$", full.names = TRUE)
+all_tiles_sf <- map(tile_files, st_read) %>% bind_rows()
+
+
+## option 1. save as geopackage since i already downloaded indiviaul .shps
+# this will be full data to refer back to
+st_write(all_tiles_sf, "data/processed/ca_activity_tiles.gpkg", layer = "all_records", delete_layer = TRUE)
+
+
+
+## option 2. save just attributes to make aggregation quicker
+tile_attributes <- all_tiles_sf %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(xtile, ytile, rcrd_st, activty)
+
+# save as Parquet for faster storage
+write_parquet(tile_attributes, "data/processed/ca_tiles_attributes.parquet")
+
+
+```
+
+
+##step 6. aggregate activity per zip code
+```{r}
+all_tiles_sf <- st_read("data/processed/ca_activity_tiles.gpkg", layer = "all_records")
+# change the name
+names(all_tiles_sf)[names(all_tiles_sf) == "activty"] <- "activity"
+
+
+## upload zipcode shp from LD data
+# i wanted to use the same zipcodes for lyme disease incidnece so i'm pulling them from this shp (will be different for other polygon aggregation)
+ldi <- st_read("data/raw/LD_incidence/CA_Zips_Lyme_NAD83.shp")
+st_crs(ldi) # EPSG:3310 - NAD83 (this is in meters not lat/lonlike WGS84/EPSG 4326)
+
+## transform meta activity tiles to match ZIP CRS
+all_tiles_sf_83 <- st_transform(all_tiles_sf, st_crs(ldi))
+
+# to just produce table (not raster)
+zip_activity_sf <- st_join(ldi, all_tiles_sf_83, join = st_intersects)
+
+# aggreage activity per zip per record (3wk period)
+zip_activity_agg <- zip_activity_sf %>% 
+  st_drop_geometry() %>% 
+  group_by(ZIP_CODE, rcrd_st) %>% 
+  summarise(total_activity = sum(activity, na.rm = TRUE), .groups = "drop")
+
+write.csv(zip_activity_agg, file = "data/processed/zip_activity_agg.csv")
+
+
+```
+make annual average activity per polygon and then extract for zip code
+
+```{r}
+all_tiles_sf_agg <- all_tiles_sf %>% 
+  group_by(geom) %>% #xtile, ytile
+  summarise(activity = mean(activity , na.rm = TRUE), .groups = "drop")
+
+all_tiles_sf_agg_lid <- st_transform(all_tiles_sf_agg, st_crs(ldi))
+
+
+ldi_valid <- st_make_valid(ldi)
+
+tiles_with_zip <- st_join(all_tiles_sf_agg_lid, ldi, join = st_intersects)
+
+
+## aggregate to zip-level mean
+zip_activity_annual <- tiles_with_zip %>% 
+  group_by(ZIP_CODE) %>% 
+  summarise(mean_activity = mean(activity, na.rm = TRUE), .groups = "drop")
+
+## ^^ but not area weighted ZIP averages
+tile_zip_intersection <- st_intersection(all_tiles_sf_agg_lid, ldi_valid)
+tile_zip_intersection <- tile_zip_intersection %>% 
+  mutate(overlap_area = st_area(geom))
+
+# area weighted mean per zip
+zip_activity_weighted <- tile_zip_intersection %>% 
+  group_by(ZIP_CODE) %>% 
+  summarise(mean_activity = as.numeric(sum(activity * overlap_area, na.rm = TRUE)/
+              sum(overlap_area, na.rm = TRUE)), .groups = "drop")
+  
+#zip_activity_weighted %>% st_drop_geometry() %>% write.csv("data/processed/activity_annual_arealweighted_zip.csv")
+
+zip_activity_weighted
+zip_activity_weighted_cashp <- st_transform(zip_activity_weighted, st_crs(ca_shp))
+ggplot() +
+  geom_sf(data = zip_activity_weighted_cashp , aes(fill = mean_activity)) +
+  geom_sf(data = ca_shp, fill = NA, color = "black", size = 0.6) +
+  scale_fill_viridis_c(na.value = "grey95", option = "mako", direction = -1) +
+  coord_sf() +
+  theme_void() +
+  labs(fill = "Activity") + 
+  theme(plot.title = element_text(face = "bold", size = 15), 
+        plot.subtitle = element_text(size = 14),
+        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+        legend.position = "bottom",
+        legend.direction = "horizontal", 
+        legend.key.width = unit(1, "cm"), 
+        legend.key.height = unit(.25, "cm"),
+        legend.title = element_text(size = 14), #vjust = .7, 
+        legend.text = element_text(size = 12),
+        legend.box.spacing = unit(0,"pt")) +
+  guides(fill = guide_colorbar(title.position = "top", title.hjust = 0))
+
+```
+
+(try again)
+```{r}
+zip_activity_weighted_vals <- tile_zip_intersection %>% 
+  st_drop_geometry() %>%
+  group_by(ZIP_CODE) %>% 
+  summarise(
+    mean_activity = as.numeric(
+      sum(activity * overlap_area, na.rm = TRUE) /
+      sum(overlap_area, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  )
+
+
+zip_activity_weighted <- ldi_valid %>%
+  left_join(zip_activity_weighted_vals, by = "ZIP_CODE")
+
+zip_activity_weighted_cashp <- st_transform(zip_activity_weighted, st_crs(ca_shp))
+
+ggplot() +
+  geom_sf(data = zip_activity_weighted_cashp, aes(fill = log(mean_activity+1))) +
+  geom_sf(data = ca_shp, fill = NA, color = "black", size = 0.6) +
+  scale_fill_viridis_c(na.value = "grey95", option = "mako", direction = -1) +
+  coord_sf() +
+  theme_void() +
+  labs(fill = "Activity")
+
+## THIS IS THE CORRECT ANNUAL ZIP HUMAN ACTIVITY
+#zip_activity_weighted %>% st_drop_geometry() %>% write.csv("data/processed/activity_annual_arealweighted_zip.csv")
+```
+
+map of ca
+```{r}
+library(sf)
+library(tigris)
+library(ggspatial)
+library(ggplot2)
+
+ca_shp <- counties(state = "CA", cb = TRUE, class = "sf")
+
+all_tiles_sf_agg <- all_tiles_sf %>% 
+  group_by(geom) %>% #xtile, ytile
+  summarise(activity = mean(activity , na.rm = TRUE), .groups = "drop")
+
+
+all_tiles_sf_agg <- st_transform(all_tiles_sf_agg, st_crs(ca_shp))
+
+all_tiles_ca <- st_intersection(
+  all_tiles_sf_agg,
+  st_make_valid(ca_shp))
+
+ggplot() +
+  geom_sf(data = all_tiles_ca, aes(fill = activity)) +
+  geom_sf(data = ca_shp, fill = NA, color = "black", size = 0.6) +
+  scale_fill_viridis_c(na.value = "grey95", option = "mako", direction = -1) +
+  coord_sf() +
+  theme_void() +
+  labs(fill = "Activity") + 
+  theme(plot.title = element_text(face = "bold", size = 15), 
+        plot.subtitle = element_text(size = 14),
+        plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+        legend.position = "bottom",
+        legend.direction = "horizontal", 
+        legend.key.width = unit(1, "cm"), 
+        legend.key.height = unit(.25, "cm"),
+        legend.title = element_text(size = 14), #vjust = .7, 
+        legend.text = element_text(size = 12),
+        legend.box.spacing = unit(0,"pt")) +
+  guides(fill = guide_colorbar(title.position = "top", title.hjust = 0))
+
+
+
+##
+library(leaflet)
+library(sf)
+library(viridisLite)
+all_tiles_ca <- st_transform(all_tiles_ca, 4326)
+ca_shp       <- st_transform(ca_shp, 4326)
+
+pal <- colorNumeric(
+  palette = viridis(256, option = "mako", direction = -1),
+  domain  = log(all_tiles_ca$activity+1),
+  na.color = "#f2f2f2")
+
+leaflet(options = leafletOptions(preferCanvas = TRUE)) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  
+  addPolygons(
+    data = all_tiles_ca,
+    fillColor   = ~pal(log(activity+1)),
+    fillOpacity = 0.9,
+    color       = NA,
+    weight      = 0
+  ) %>%
+  
+  addPolygons(
+    data = ca_shp,
+    fill = FALSE,
+    color = "black",
+    weight = 1
+  ) %>%
+  
+  addLegend(
+    pal = pal,
+    values = log(all_tiles_ca$activity+1),
+    title = "Activity",
+    position = "bottomright"
+  )
+
+```
+
+
+

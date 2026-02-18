@@ -1,0 +1,1524 @@
+---
+title: "Analysis_20251005"
+output: html_document
+date: "2025-10-06"
+---
+
+temporal stuff
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(wesanderson)
+library(ggspatial)
+library(cowplot)
+
+pal <- wes_palette("Zissou1", 4, type = "continuous")
+```
+
+
+upload data
+```{r}
+
+district_boundary <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp")
+```
+
+Sierra
+```{r}
+# Filter to relevant districts
+district_outline_sierra <- district_boundary %>%
+  filter(district %in% c("Gold Fields District", "Sierra District"))
+
+
+casp_fulldata_monthly4_sierra <- casp_fulldata_monthly %>%
+  filter(district %in% c("Gold Fields District","Sierra District")) %>%
+  st_make_valid() %>%
+  mutate(
+    tick_monthly_presence_z = scale(tick_monthly_presence),
+    flickrgbif_estimatedvisits_z = scale(flickrgbif_estimatedvisits),
+    index_z = tick_monthly_presence_z * flickrgbif_estimatedvisits_z) %>%
+  filter(!is.na(index_z)) %>%
+  mutate(
+    index_quartile = ntile(index_z, 4),
+    index_cat = factor(index_quartile, levels = 1:4,
+                       labels = c("Low", "Moderate", "High", "Very High")))
+
+casp_fulldata_monthly4_sierra_crop <- st_crop(casp_fulldata_monthly4_sierra, bbox)
+
+casp_centroids_sierra <- st_centroid(casp_fulldata_monthly4_sierra_crop)
+target_crs_sierra  <- st_crs(district_outline_sierra)
+casp_centroids_sierra  <- st_transform(casp_centroids_sierra , crs = target_crs_sierra )
+
+
+district_outline_sierra  <- st_transform(district_outline_sierra , crs = target_crs_sierra )
+district_outline_sierra_crop <- st_crop(district_outline_sierra, bbox)
+
+
+# Function to make map for a given month
+make_map <- function(data, month_num, title_month) {
+  data %>%
+    filter(month == month_num) %>%
+    ggplot() +
+    geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 2, alpha = 0.9) +
+    geom_sf(data = district_outline_sierra , fill = NA, color = "black", size = 0.6) + #_crop
+    scale_fill_manual(
+      values = c("Low" = "#3A9AB2", 
+                 "Moderate" = "#ADC397", 
+                 "High" = "#E5A208", 
+                 "Very High" = "#F11B00"),
+      name = "Risk Index\n(Quartiles)") +
+    labs(title = paste(title_month)) +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16, margin = margin(b=0)),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      legend.margin = margin(t = 0, b = 0),
+      plot.margin = unit(c(0, 0, 0, 0), "cm")) 
+}
+
+
+map_sierra_1 <- make_map(casp_centroids_sierra, 1, "January")
+map_sierra_3 <- make_map(casp_centroids_sierra, 3, "March")
+map_sierra_4 <- make_map(casp_centroids_sierra, 4, "April")
+map_sierra_5 <- make_map(casp_centroids_sierra, 5, "May")
+map_sierra_7 <- make_map(casp_centroids_sierra, 7, "July")
+map_sierra_9 <- make_map(casp_centroids_sierra, 9, "September")
+map_sierra_10 <- make_map(casp_centroids_sierra, 10, "October")
+map_sierra_11 <- make_map(casp_centroids_sierra, 11, "November")
+
+
+temp_sierra <- ggarrange(
+  map_sierra_1, 
+  map_sierra_4,
+  map_sierra_7, 
+  map_sierra_10, 
+  ncol = 4, nrow = 1,
+  common.legend = TRUE, legend = "bottom",
+  align = "hv", 
+  widths = c(1,1,1,1))
+
+temp_sierra_an2 <- annotate_figure(temp_sierra, 
+                           top = text_grob("Sierra Foothills", size = 16, face = "bold", hjust = 0.5),
+                           fig.lab = NULL, bottom = NULL, left = NULL, right = NULL)
+#ggsave(temp_sierra_an2, file = "figures/temporalindex_sierra2.png", width = 5, height = 3, dpi = 300, bg = "white")
+
+
+```
+
+Bay Area
+```{r}
+# Filter to relevant districts
+district_outline_ba <- district_boundary %>%
+  filter(district %in% c("Sonoma-Mendocino Coast District", "Bay Area District"))
+
+
+casp_fulldata_monthly4_ba <- casp_fulldata_monthly %>%
+  filter(district %in% c("Sonoma-Mendocino Coast District", "Bay Area District")) %>%
+  st_make_valid() %>%
+  mutate(
+    tick_monthly_presence_z = scale(tick_monthly_presence),
+    flickrgbif_estimatedvisits_z = scale(flickrgbif_estimatedvisits),
+    index_z = tick_monthly_presence_z * flickrgbif_estimatedvisits_z) %>%
+  filter(!is.na(index_z)) %>%
+  mutate(
+    index_quartile = ntile(index_z, 4),
+    index_cat = factor(index_quartile, levels = 1:4,
+                       labels = c("Low", "Moderate", "High", "Very High")))
+
+casp_centroids_ba <- st_centroid(casp_fulldata_monthly4_ba )
+target_crs_ba  <- st_crs(district_outline_ba)
+casp_centroids_ba  <- st_transform(casp_centroids_ba , crs = target_crs_ba )
+district_outline_ba  <- st_transform(district_outline_ba , crs = target_crs_ba )
+
+
+# Function to make map for a given month
+make_map <- function(data, month_num, title_month) {
+  data %>%
+    filter(month == month_num) %>%
+    ggplot() +
+    geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 2, alpha = 0.9) +
+    geom_sf(data = district_outline_ba , fill = NA, color = "black", size = 0.6) +
+    scale_fill_manual(
+      values = c("Low" = "#3A9AB2", 
+                 "Moderate" = "#ADC397", 
+                 "High" = "#E5A208", 
+                 "Very High" = "#F11B00"),
+      name = "Risk Index\n(Quartiles)") +
+    labs(title = paste(title_month)) +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16, margin = margin(b=0)),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      legend.margin = margin(t = 0, b = 0),
+      plot.margin = unit(c(0, 0, 0, 0), "cm")) 
+}
+
+
+map_ba_1 <- make_map(casp_centroids_ba, 1, "January")
+map_ba_3 <- make_map(casp_centroids_ba, 3, "March")
+map_ba_4 <- make_map(casp_centroids_ba, 4, "April")
+map_ba_5 <- make_map(casp_centroids_ba, 5, "May")
+map_ba_7 <- make_map(casp_centroids_ba, 7, "July")
+map_ba_9 <- make_map(casp_centroids_ba, 9, "September")
+map_ba_10 <- make_map(casp_centroids_ba, 10, "October")
+map_ba_11 <- make_map(casp_centroids_ba, 11, "November")
+
+
+temp_ba <- ggarrange(
+  map_ba_1, 
+  map_ba_4,
+  map_ba_7, 
+  map_ba_10, 
+  ncol = 4, nrow = 1,
+  common.legend = TRUE, legend = "bottom",
+  align = "hv", 
+  widths = c(1,1,1,1))
+
+temp_ba_an <- annotate_figure(temp_ba, 
+                           top = text_grob("San Francisco Bay Area", size = 16, face = "bold", hjust = 0.5),
+                           fig.lab = NULL, bottom = NULL, left = NULL, right = NULL)
+#ggsave(temp_ba_an, file = "figures/temporalindex_ba.png", width = 5, height = 3, dpi = 300, bg = "white")
+
+
+```
+
+
+Combine them
+```{r}
+
+temp_ba_nolegend <- ggarrange(
+  map_ba_1 + guides(fill = FALSE), 
+  map_ba_4 + guides(fill = FALSE),
+  map_ba_7 + guides(fill = FALSE), 
+  map_ba_10 + guides(fill = FALSE), 
+  ncol = 4, nrow = 1,
+  common.legend = FALSE, legend = "bottom",
+  align = "hv", 
+  widths = c(1,1,1,1))
+
+temp_ba_an_nolegend <- annotate_figure(temp_ba_nolegend, 
+                           top = text_grob("San Francisco Bay Area", size = 16, face = "bold", hjust = 0.5),
+                           fig.lab = NULL, bottom = NULL, left = NULL, right = NULL)
+
+
+
+temp_sierra_nolegend <- ggarrange(
+  map_sierra_1 + guides(fill = FALSE), 
+  map_sierra_4 + guides(fill = FALSE),
+  map_sierra_7 + guides(fill = FALSE), 
+  map_sierra_10 + guides(fill = FALSE), 
+  ncol = 4, nrow = 1,
+  common.legend = FALSE, legend = "bottom",
+  align = "hv", 
+  widths = c(1,1,1,1))
+
+temp_sierra_an_nolegend <- annotate_figure(temp_sierra_nolegend, 
+                           top = text_grob("Sierra Foothills", size = 16, face = "bold", hjust = 0.5),
+                           fig.lab = NULL, bottom = NULL, left = NULL, right = NULL)
+
+
+temporal <- ggarrange(temp_ba_an_nolegend,temp_sierra_an_nolegend,
+          ncol = 1, nrow = 2)
+
+#ggsave(temporal, file = "figures/temporalindex_both.png", width = 5, height = 5, dpi = 300, bg = "white")
+```
+
+
+make inset of map and legend
+```{r}
+# Read full district boundaries
+district_boundary <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp") %>%
+  st_transform(4326)
+
+# Subset for full state map
+state_outline <- district_boundary  # use for inset background
+
+# Subset your main area (e.g., Gold Fields + Sierra)
+focus_districts <- district_boundary %>%
+  filter(district %in% c("Gold Fields District", "Sierra District", "Sonoma-Mendocino Coast District", "Bay Area District"))  # or Bay Area etc.
+
+## make filtered map
+# Define bbox in same CRS (WGS84)
+bbox <- st_bbox(c(xmin = -124, xmax = -120, ymin = 36, ymax = 41), crs = st_crs(district_boundary))
+
+# Apply crop AFTER transformation
+focus_districts_filtered <- st_crop(focus_districts, bbox)
+
+inset_map <- ggplot() +
+  geom_sf(data = state_outline, fill = "grey90", color = "white") +
+  geom_sf(data = focus_districts_filtered, fill = "tomato", color = "black", size = 0.8) +
+  theme_void() +
+  labs(title = "California Park Districts") +
+  theme(plot.title = element_text(face = "bold", size = 14)) +
+   annotation_north_arrow(location = "tr", which_north = "true",
+                         height = unit(1.2, "cm"),
+                         width = unit(1.2, "cm"),
+                         pad_x = unit(1.6, "cm"), pad_y = unit(1.2, "cm")) +  # 2.5 also worked
+  
+  annotation_scale(location = "tr", width_hint = 0.3, text_cex = 0.9, pad_x = unit(.75, "cm"), pad_y = unit(.7, "cm"))
+
+
+#ggsave(inset_map, file = "figures/insetmap_district.png", dpi = 300, height = 3, width = 3, bg = "white")
+```
+
+
+get legend
+```{r}
+
+legend_map <-   casp_centroids_ba %>%
+    #filter(month == month_num) %>%
+    ggplot() +
+    geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 4, alpha = 0.9) +
+    geom_sf(data = district_outline_ba , fill = NA, color = "black", size = 0.6) +
+    scale_fill_manual(
+      values = c("Low" = "#3A9AB2", 
+                 "Moderate" = "#ADC397", 
+                 "High" = "#E5A208", 
+                 "Very High" = "#F11B00"),
+      name = "Risk Index\n(Quartiles)") +
+    #labs(title = paste(title_month)) +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16, margin = margin(b=0), face = "bold"),
+      legend.title = element_text(size = 14),
+      legend.text = element_text(size = 12),
+      legend.margin = margin(t = 0, b = 0),
+      plot.margin = unit(c(0, 0, 0, 0), "cm")) 
+
+
+legend_plot <- get_legend(legend_map)
+legend <- ggdraw(legend_plot)
+
+#ggsave(legend, file = "figures/riskmap_legend.png", dpi = 300, bg = "white", width = 1.5, height = 1.5)
+```
+
+
+make long
+
+```{r}
+
+temp_ba_long <- 
+ggarrange(
+  map_ba_1 + guides(fill = FALSE) + labs(title = NULL), #+ theme(plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")), 
+  map_ba_4 + guides(fill = FALSE) + labs(title = NULL), #+ theme(plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")),
+  map_ba_7 + guides(fill = FALSE) + labs(title = NULL), #+ theme(plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")), 
+  map_ba_10 + guides(fill = FALSE) + labs(title = NULL), # + theme(plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")), 
+  ncol = 1, nrow = 4,
+  common.legend = TRUE, legend = "right",
+  align = "hv", heights = c(4.0,4.0,4.0,4.0), widths = c(4.0, 4.0, 4.0, 4.0)
+  )
+
+month_label <- text_grob(label = "Oct. Jan.   April  July   ",
+                         size = 12, hjust = 0.5, rot = 90)
+
+temp_ba_long_an_nolegend <- annotate_figure(temp_ba_long, 
+                           top = text_grob("Bay Area", size = 16, face = "bold", hjust = 0.5),
+                           #left = month_label,
+                           fig.lab = NULL, bottom = NULL, right = NULL)
+
+ggsave(temp_ba_long_an_nolegend, file = "figures/temp_ba_long.png", bg = "white", dpi = 300, width = 2, height = 6)
+
+temp_sierra_long <- ggarrange(
+  map_sierra_1 + guides(fill = FALSE) + labs(title = NULL), #+ theme(plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")), 
+  map_sierra_4 + guides(fill = FALSE) + labs(title = NULL), #+ theme(plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")),
+  map_sierra_7 + guides(fill = FALSE) + labs(title = NULL), #+ theme(plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")), 
+  map_sierra_10 + guides(fill = FALSE) + labs(title = NULL), # + theme(plot.margin = unit(c(0.5, 0.5, 0.5, 0.5), "cm")), 
+  ncol = 1, nrow = 4,
+  common.legend = TRUE, legend = "right",
+  align = "hv", heights = c(4.0,4.0,4.0,4.0), widths = c(4.0, 4.0, 4.0, 4.0)
+  )
+
+
+temp_sierra_long_an_nolegend <- annotate_figure(temp_sierra_long, 
+                           top = text_grob("Sierra Foothills", size = 16, face = "bold", hjust = 0.5),
+                           #left = NULL, 
+                           fig.lab = NULL, bottom = NULL, right = NULL)
+
+ggsave(temp_sierra_long_an_nolegend, file = "figures/temp_sierra_long.png", bg = "white", dpi = 300, width = 2, height = 6)
+
+temporal_long <- ggarrange(temp_ba_long,temp_sierra_long,
+          ncol = 2, nrow = 1)
+
+#ggsave(temporal_long, file = "figures/temporalindex_both_long.png", width = 5, height = 5, dpi = 300, bg = "white")
+```
+
+
+update after talk with Aly
+
+(make single district)
+```{r}
+
+### sierra
+district_outline_sierra <- district_boundary %>%
+  filter(district == "Gold Fields District")
+
+casp_fulldata_monthly4_sierra <- casp_fulldata_monthly %>%
+  filter(district == "Gold Fields District") %>%
+  st_make_valid() %>%
+  mutate(
+    tick_monthly_presence_z = as.numeric(scale(tick_monthly_presence)),
+    flickrgbif_estimatedvisits_z = as.numeric(scale(flickrgbif_estimatedvisits)),
+    index_z = tick_monthly_presence_z * flickrgbif_estimatedvisits_z
+  ) %>%
+  filter(!is.na(index_z)) %>%
+  mutate(
+    index_quartile = ntile(index_z, 4),
+    index_cat = factor(
+      index_quartile,
+      levels = 1:4,
+      labels = c("Low", "Moderate", "High", "Very High")
+    )
+  )
+
+target_crs_sierra <- st_crs(district_outline_sierra)
+
+casp_fulldata_monthly4_sierra_crop <- st_crop(
+  casp_fulldata_monthly4_sierra, bbox
+) %>%
+  st_transform(crs = target_crs_sierra)
+
+casp_centroids_sierra <- st_centroid(
+  casp_fulldata_monthly4_sierra_crop
+)
+
+district_outline_sierra <- st_transform(
+  district_outline_sierra,
+  crs = target_crs_sierra
+)
+
+district_outline_sierra_crop <- st_crop(district_outline_sierra, bbox)
+
+# Function to make map for a given month
+make_map <- function(data, month_num, title_month) {
+  data %>%
+    filter(month == month_num) %>%
+    ggplot() +
+    geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 2, alpha = 0.9) +
+    geom_sf(data = district_outline_sierra , fill = NA, color = "black", size = 0.6) + #_crop
+    scale_fill_manual(
+      values = c("Low" = "#3A9AB2", 
+                 "Moderate" = "#ADC397", 
+                 "High" = "#E5A208", 
+                 "Very High" = "#F11B00"),
+      name = "Risk Index\n(Quartiles)") +
+    labs(title = paste(title_month)) +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16, margin = margin(b=0)),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      legend.margin = margin(t = 0, b = 0),
+      plot.margin = unit(c(0, 0, 0, 0), "cm")) 
+}
+
+
+map_sierra_1 <- make_map(casp_centroids_sierra, 1, "January")
+map_sierra_3 <- make_map(casp_centroids_sierra, 3, "March")
+map_sierra_4 <- make_map(casp_centroids_sierra, 4, "April")
+map_sierra_5 <- make_map(casp_centroids_sierra, 5, "May")
+map_sierra_7 <- make_map(casp_centroids_sierra, 7, "July")
+map_sierra_9 <- make_map(casp_centroids_sierra, 9, "September")
+map_sierra_10 <- make_map(casp_centroids_sierra, 10, "October")
+map_sierra_11 <- make_map(casp_centroids_sierra, 11, "November")
+
+
+temp_sierra <- ggarrange(
+  map_sierra_1, 
+  map_sierra_4,
+  map_sierra_7, 
+  map_sierra_10, 
+  ncol = 4, nrow = 1,
+  common.legend = TRUE, legend = "bottom",
+  align = "hv", 
+  widths = c(1,1,1,1))
+
+temp_sierra_an2 <- annotate_figure(temp_sierra, 
+                           top = text_grob("Sierra Foothills", size = 16, face = "bold", hjust = 0.5),
+                           fig.lab = NULL, bottom = NULL, left = NULL, right = NULL)
+
+
+
+###nay area
+
+district_outline_bayarea <- district_boundary %>%
+  filter(district == "Bay Area District")
+
+casp_fulldata_monthly4_bayarea <- casp_fulldata_monthly %>%
+  filter(district == "Bay Area District") %>%
+  st_make_valid() %>%
+  mutate(
+    tick_monthly_presence_z = as.numeric(scale(tick_monthly_presence)),
+    flickrgbif_estimatedvisits_z = as.numeric(scale(flickrgbif_estimatedvisits)),
+    index_z = tick_monthly_presence_z * flickrgbif_estimatedvisits_z
+  ) %>%
+  filter(!is.na(index_z)) %>%
+  mutate(
+    index_quartile = ntile(index_z, 4),
+    index_cat = factor(
+      index_quartile,
+      levels = 1:4,
+      labels = c("Low", "Moderate", "High", "Very High")
+    )
+  )
+
+target_crs_bayarea <- st_crs(district_outline_bayarea)
+
+casp_fulldata_monthly4_bayarea_crop <- st_crop(
+  casp_fulldata_monthly4_bayarea, bbox
+) %>%
+  st_transform(crs = target_crs_bayarea)
+
+casp_centroids_bayarea <- st_centroid(
+  casp_fulldata_monthly4_bayarea_crop
+)
+
+district_outline_bayarea <- st_transform(
+  district_outline_bayarea,
+  crs = target_crs_bayarea
+)
+
+district_outline_bayarea_crop <- st_crop(district_outline_bayarea, bbox)
+
+# Function to make map for a given month
+make_map <- function(data, month_num, title_month) {
+  data %>%
+    filter(month == month_num) %>%
+    ggplot() +
+    geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 2, alpha = 0.9) +
+    geom_sf(data = district_outline_bayarea , fill = NA, color = "black", size = 0.6) + #_crop
+    scale_fill_manual(
+      values = c("Low" = "#3A9AB2", 
+                 "Moderate" = "#ADC397", 
+                 "High" = "#E5A208", 
+                 "Very High" = "#F11B00"),
+      name = "Risk Index\n(Quartiles)") +
+    labs(title = paste(title_month)) +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16, margin = margin(b=0)),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      legend.margin = margin(t = 0, b = 0),
+      plot.margin = unit(c(0, 0, 0, 0), "cm")) 
+}
+
+
+map_bayarea_1 <- make_map(casp_centroids_bayarea, 1, "January")
+map_bayarea_3 <- make_map(casp_centroids_bayarea, 3, "March")
+map_bayarea_4 <- make_map(casp_centroids_bayarea, 4, "April")
+map_bayarea_5 <- make_map(casp_centroids_bayarea, 5, "May")
+map_bayarea_7 <- make_map(casp_centroids_bayarea, 7, "July")
+map_bayarea_9 <- make_map(casp_centroids_bayarea, 9, "September")
+map_bayarea_10 <- make_map(casp_centroids_bayarea, 10, "October")
+map_bayarea_11 <- make_map(casp_centroids_bayarea, 11, "November")
+
+
+temp_bayarea <- ggarrange(
+  map_bayarea_1, 
+  map_bayarea_4,
+  map_bayarea_7, 
+  map_bayarea_10, 
+  ncol = 4, nrow = 1,
+  common.legend = TRUE, legend = "bottom",
+  align = "hv", 
+  widths = c(1,1,1,1))
+
+temp_bayarea_an2 <- annotate_figure(temp_bayarea, 
+                           top = text_grob("Bay Area", size = 16, face = "bold", hjust = 0.5),
+                           fig.lab = NULL, bottom = NULL, left = NULL, right = NULL)
+
+
+temp_bayarea_an2 + guides(color = FALSE)
+temp_sierra_an2 
+
+ggarrange(temp_bayarea_an2 , temp_sierra_an2 + rremove("legend"), ncol = 1)
+```
+
+
+```{r}
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(sf)
+
+# ---------------------------
+# 1. Map function with optional title
+# ---------------------------
+make_map_no_legend <- function(data, month_num, district_outline, title_month = NULL) {
+  data_month <- data %>% filter(month == month_num)
+  
+  p <- ggplot(data_month) +
+    geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 2, alpha = 0.9, show.legend = FALSE) +
+    geom_sf(data = district_outline, fill = NA, color = "black", size = 0.6) +
+    scale_fill_manual(
+      values = c("Low" = "#3A9AB2", 
+                 "Moderate" = "#ADC397", 
+                 "High" = "#E5A208", 
+                 "Very High" = "#F11B00")
+    ) +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16),
+      plot.margin = unit(c(0, 0, 0, 0), "cm")
+    )
+  
+  # Only add title if specified
+  if (!is.null(title_month)) {
+    p <- p + labs(title = title_month)
+  }
+  
+  return(p)
+}
+
+# ---------------------------
+# 2. Bay Area maps with month titles
+# ---------------------------
+bay_months <- c("January", "April", "July", "October")
+bay_month_numbers <- c(1,4,7,10)
+
+map_bayarea_list <- lapply(1:4, function(i) {
+  make_map_no_legend(casp_centroids_bayarea, bay_month_numbers[i], district_outline_bayarea, title_month = bay_months[i])
+})
+
+# ---------------------------
+# 3. Sierra maps WITHOUT month titles
+# ---------------------------
+map_sierra_list <- lapply(1:4, function(i) {
+  make_map_no_legend(casp_centroids_sierra, bay_month_numbers[i], district_outline_sierra, title_month = NULL)
+})
+
+# ---------------------------
+# 4. Arrange horizontally per location
+# ---------------------------
+temp_bayarea <- ggarrange(plotlist = map_bayarea_list, ncol = 4, nrow = 1)
+temp_sierra  <- ggarrange(plotlist = map_sierra_list, ncol = 4, nrow = 1)
+
+# ---------------------------
+# 5. Add right-hand location labels
+# ---------------------------
+bayarea_labeled <- annotate_figure(temp_bayarea,
+                                  left = text_grob("Bay Area", rot = 90, face = "bold", size = 16))
+sierra_labeled <- annotate_figure(temp_sierra,
+                                  left = text_grob("Foothills", rot = 90, face = "bold", size = 16))
+
+
+# ---------------------------
+# 6. Combine vertically
+# ---------------------------
+final_plot <- ggarrange(
+  bayarea_labeled,
+  sierra_labeled,
+  ncol = 1,
+  nrow = 2
+)
+
+final_plot
+
+
+
+
+## add inset 
+# Read full district boundaries
+district_boundary <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp") %>%
+  st_transform(4326)
+
+# Subset for full state map
+state_outline <- district_boundary  # use for inset background
+
+# Subset your main area (e.g., Gold Fields + Sierra)
+focus_districts <- district_boundary %>%
+  filter(district %in% c("Gold Fields District",  "Bay Area District"))  # or Bay Area etc.
+
+## make filtered map
+# Define bbox in same CRS (WGS84)
+bbox <- st_bbox(c(xmin = -124, xmax = -120, ymin = 36, ymax = 41), crs = st_crs(district_boundary))
+
+# Apply crop AFTER transformation
+focus_districts_filtered <- st_crop(focus_districts, bbox)
+
+inset_map <- ggplot() +
+  geom_sf(data = state_outline, fill = "grey90", color = "white") +
+  geom_sf(data = focus_districts_filtered, fill = "tomato", color = "black", size = 0.8) +
+  theme_void() +
+  labs(title = "California Park Districts") +
+  theme(plot.title = element_text(face = "bold", size = 14)) +
+   annotation_north_arrow(location = "tr", which_north = "true",
+                         height = unit(1.2, "cm"),
+                         width = unit(1.2, "cm"),
+                         pad_x = unit(1.6, "cm"), pad_y = unit(1.2, "cm")) +  # 2.5 also worked
+  
+  annotation_scale(location = "tr", width_hint = 0.3, text_cex = 0.9, pad_x = unit(.75, "cm"), pad_y = unit(.7, "cm"))
+
+
+
+## combine
+final_plot + (inset_map/legend) 
+```
+
+
+try adding a couple more
+```{r}
+
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+
+# --- Read and filter district shapefile ---
+district_outline <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp") %>%
+  filter(district == "Orange Coast District") %>%
+  st_transform(crs = 4326)  # WGS84
+
+# --- Define bbox in same CRS ---
+bbox <- st_as_sfc(st_bbox(district_outline), crs = st_crs(district_outline))
+
+# --- Filter district data ---
+district_outline_angeles <- district_outline
+
+# --- Prepare tick data ---
+casp_fulldata_monthly4_angeles <- casp_fulldata_monthly %>%
+  filter(district == "Orange Coast District") %>%
+  st_make_valid() %>%
+  mutate(
+    tick_monthly_presence_z = as.numeric(scale(tick_monthly_presence)),
+    flickrgbif_estimatedvisits_z = as.numeric(scale(flickrgbif_estimatedvisits)),
+    index_z = tick_monthly_presence_z * flickrgbif_estimatedvisits_z
+  ) %>%
+  filter(!is.na(index_z)) %>%
+  mutate(
+    index_quartile = ntile(index_z, 4),
+    index_cat = factor(
+      index_quartile,
+      levels = 1:4,
+      labels = c("Low", "Moderate", "High", "Very High")
+    )
+  )
+
+# --- Crop and transform to district CRS ---
+target_crs_angeles <- st_crs(district_outline_angeles)
+
+casp_fulldata_monthly4_angeles_crop <- casp_fulldata_monthly4_angeles %>%
+  st_transform(crs = target_crs_angeles) %>%
+  st_crop(bbox)
+
+# --- Compute centroids for plotting ---
+casp_centroids_angeles <- st_centroid(casp_fulldata_monthly4_angeles_crop)
+
+district_outline_angeles <- st_transform(district_outline_angeles, crs = target_crs_angeles)
+
+# --- Function to make monthly map ---
+make_map <- function(data, month_num, title_month) {
+  data %>%
+    filter(month == month_num) %>%
+    ggplot() +
+    geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 5, alpha = 0.9) +
+    geom_sf(data = district_outline_angeles, fill = NA, color = "black", size = 0.6) +
+    scale_fill_manual(
+      values = c(
+        "Low" = "#3A9AB2", 
+        "Moderate" = "#ADC397", 
+        "High" = "#E5A208", 
+        "Very High" = "#F11B00"
+      ),
+      name = "Risk Index\n(Quartiles)"
+    ) +
+    labs(title = title_month) +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16, margin = margin(b=0)),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      legend.margin = margin(t = 0, b = 0),
+      plot.margin = unit(c(0, 0, 0, 0), "cm")
+    )
+}
+
+# --- Make monthly maps ---
+map_angeles_1 <- make_map(casp_centroids_angeles, 1, "January")
+map_angeles_4 <- make_map(casp_centroids_angeles, 4, "April")
+map_angeles_7 <- make_map(casp_centroids_angeles, 7, "July")
+map_angeles_10 <- make_map(casp_centroids_angeles, 10, "October")
+
+# --- Arrange maps ---
+temp_angeles <- ggarrange(
+  map_angeles_1, map_angeles_4, map_angeles_7, map_angeles_10,
+  ncol = 4, nrow = 1,
+  common.legend = TRUE, legend = "bottom",
+  align = "hv"
+)
+
+temp_angeles_an2 <- annotate_figure(
+  temp_angeles, 
+  top = text_grob("Orange Coast", size = 16, face = "bold", hjust = 0.5)
+)
+
+
+```
+
+```{r}
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+
+# --- Read and filter district shapefile ---
+district_outline <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp") %>%
+  filter(district == "Ocotillo Wells District") %>%
+  st_transform(crs = 4326)  # WGS84
+
+# --- Define bbox in same CRS ---
+bbox <- st_as_sfc(st_bbox(district_outline), crs = st_crs(district_outline))
+
+# --- Filter district data ---
+district_outline_angeles <- district_outline
+
+# --- Prepare tick data ---
+casp_fulldata_monthly4_angeles <- casp_fulldata_monthly %>%
+  filter(district == "Ocotillo Wells District") %>%
+  st_make_valid() %>%
+  mutate(
+    tick_monthly_presence_z = as.numeric(scale(tick_monthly_presence)),
+    flickrgbif_estimatedvisits_z = as.numeric(scale(flickrgbif_estimatedvisits)),
+    index_z = tick_monthly_presence_z * flickrgbif_estimatedvisits_z
+  ) %>%
+  filter(!is.na(index_z)) %>%
+  mutate(
+    index_quartile = ntile(index_z, 4),
+    index_cat = factor(
+      index_quartile,
+      levels = 1:4,
+      labels = c("Low", "Moderate", "High", "Very High")
+    )
+  )
+
+# --- Crop and transform to district CRS ---
+target_crs_angeles <- st_crs(district_outline_angeles)
+
+casp_fulldata_monthly4_angeles_crop <- casp_fulldata_monthly4_angeles %>%
+  st_transform(crs = target_crs_angeles) %>%
+  st_crop(bbox)
+
+# --- Compute centroids for plotting ---
+casp_centroids_angeles <- st_centroid(casp_fulldata_monthly4_angeles_crop)
+
+district_outline_angeles <- st_transform(district_outline_angeles, crs = target_crs_angeles)
+
+# --- Function to make monthly map ---
+make_map <- function(data, month_num, title_month) {
+  data %>%
+    filter(month == month_num) %>%
+    ggplot() +
+    geom_sf(aes(fill = index_cat), shape = 21, color = "black", size = 5, alpha = 0.9) +
+    geom_sf(data = district_outline_angeles, fill = NA, color = "black", size = 0.6) +
+    scale_fill_manual(
+      values = c(
+        "Low" = "#3A9AB2", 
+        "Moderate" = "#ADC397", 
+        "High" = "#E5A208", 
+        "Very High" = "#F11B00"
+      ),
+      name = "Risk Index\n(Quartiles)"
+    ) +
+    labs(title = title_month) +
+    theme_void() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 16, margin = margin(b=0)),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10),
+      legend.margin = margin(t = 0, b = 0),
+      plot.margin = unit(c(0, 0, 0, 0), "cm")
+    )
+}
+
+# --- Make monthly maps ---
+map_angeles_1 <- make_map(casp_centroids_angeles, 1, "January")
+map_angeles_4 <- make_map(casp_centroids_angeles, 4, "April")
+map_angeles_7 <- make_map(casp_centroids_angeles, 7, "July")
+map_angeles_10 <- make_map(casp_centroids_angeles, 10, "October")
+
+# --- Arrange maps ---
+temp_angeles <- ggarrange(
+  map_angeles_1, map_angeles_4, map_angeles_7, map_angeles_10,
+  ncol = 4, nrow = 1,
+  common.legend = TRUE, legend = "bottom",
+  align = "hv"
+)
+
+temp_angeles_an2 <- annotate_figure(
+  temp_angeles, 
+  top = text_grob("Ocotillo Wells", size = 16, face = "bold", hjust = 0.5)
+)
+
+
+```
+
+Try aly's suggestion of lines
+
+```{r}
+
+normalized <- casp_fulldata_monthly %>%
+  #filter(district %in% c("Gold Fields District","Sierra District")) %>%
+  st_make_valid() %>%
+  mutate(
+    tick_monthly_presence_z = scale(tick_monthly_presence),
+    flickrgbif_estimatedvisits_z = scale(flickrgbif_estimatedvisits),
+    index_z = tick_monthly_presence_z * flickrgbif_estimatedvisits_z) %>%
+  filter(!is.na(index_z)) 
+
+
+normalized %>% 
+  filter(district == "Bay Area District") %>% 
+  ggplot(aes(x = as.integer(month), y = tick_monthly_presence_z)) +
+  geom_smooth() +
+  geom_smooth(aes(x = as.integer(month), y = flickrgbif_estimatedvisits_z), color ="red")+
+  geom_hline(yintercept = 0)
+
+normalized %>% 
+  filter(district == "Bay Area District") %>% 
+  ggplot(aes(x = as.integer(month), y = tick_monthly_presence)) +
+  geom_smooth() +
+  geom_smooth(aes(x = as.integer(month), y = flickrgbif_estimatedvisits), color ="red")+
+  geom_hline(yintercept = 0)
+
+
+
+## try again 
+normalized <- casp_fulldata_monthly %>%
+  st_make_valid() %>%
+  group_by(district) %>%   # important if districts differ in scale
+  mutate(
+    tick_norm = tick_monthly_presence,  # already 0–1
+    human_norm = (flickrgbif_estimatedvisits - min(flickrgbif_estimatedvisits, na.rm = TRUE)) /
+                 (max(flickrgbif_estimatedvisits, na.rm = TRUE) - min(flickrgbif_estimatedvisits, na.rm = TRUE))
+  ) %>%
+  ungroup()
+
+normalized %>%
+  filter(district == "Ocotillo Wells District") %>%
+  ggplot(aes(x = as.integer(month))) +
+  geom_smooth(aes(y = tick_norm), color = "red", se = FALSE) +
+  geom_smooth(aes(y = human_norm), color =  "darkgreen", se = FALSE) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    y = "Normalized intensity (0–1)",
+    x = "Month",
+    title = "Seasonal overlap of tick suitability and human activity"
+  ) +
+  theme_minimal()
+
+
+```
+
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+
+normalized <- casp_fulldata_monthly %>%
+  st_make_valid() %>%
+  group_by(district) %>%
+  mutate(
+    tick_norm = tick_monthly_presence,  # already 0–1
+    human_norm = (flickrgbif_estimatedvisits - min(flickrgbif_estimatedvisits, na.rm = TRUE)) /
+                 (max(flickrgbif_estimatedvisits, na.rm = TRUE) - min(flickrgbif_estimatedvisits, na.rm = TRUE)),
+    overlap_index = tick_norm * human_norm
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(overlap_index))
+
+
+normalized %>%
+  filter(district == "Bay Area District") %>%
+  ggplot(aes(x = as.integer(month))) +
+  geom_smooth(aes(y = tick_norm, color = "Tick suitability"),
+              se = FALSE, linewidth = 1.2) +
+  geom_smooth(aes(y = human_norm, color = "Human activity"),
+              se = FALSE, linewidth = 1.2) +
+  geom_smooth(aes(y = overlap_index, color = "Overlap"),
+              se = FALSE, linewidth = 1.4, linetype = "dashed") +
+  scale_color_manual(
+    values = c(
+      "Tick suitability" = "darkgreen",
+      "Human activity" = "red",
+      "Overlap" = "purple"
+    )
+  ) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    x = "Month",
+    y = "Normalized intensity (0–1)",
+    color = "",
+    title = "Seasonal overlap of tick suitability and human activity",
+    subtitle = "Dashed line indicates joint risk potential"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+threshold <- quantile(normalized$overlap_index, 0.75, na.rm = TRUE)
+
+normalized %>%
+  filter(district == "Bay Area District") %>%
+  ggplot(aes(x = as.integer(month))) +
+  geom_rect(
+    data = ~subset(.x, overlap_index >= threshold),
+    aes(xmin = month - 0.5, xmax = month + 0.5,
+        ymin = 0, ymax = 1),
+    fill = "purple", alpha = 0.15, inherit.aes = FALSE
+  ) +
+  geom_smooth(aes(y = tick_norm), color = "darkgreen", se = FALSE) +
+  geom_smooth(aes(y = human_norm), color = "red", se = FALSE) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    x = "Month",
+    y = "Normalized intensity (0–1)",
+    title = "Months with high tick–human activity overlap"
+  ) +
+  theme_minimal()
+
+normalized %>%
+  filter(district == "Ocotillo Wells District") %>%
+  ggplot(aes(x = as.integer(month))) +
+  geom_rect(
+    data = ~subset(.x, overlap_index >= threshold),
+    aes(xmin = month - 0.5, xmax = month + 0.5,
+        ymin = 0, ymax = 1),
+    fill = "purple", alpha = 0.15, inherit.aes = FALSE
+  ) +
+  geom_smooth(aes(y = tick_norm), color = "darkgreen", se = FALSE) +
+  geom_smooth(aes(y = human_norm), color = "red", se = FALSE) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    x = "Month",
+    y = "Normalized intensity (0–1)",
+    title = "Months with high tick–human activity overlap"
+  ) +
+  theme_minimal()
+
+
+normalized %>%
+  filter(district == "Sierra District") %>%
+  ggplot(aes(x = as.integer(month))) +
+  geom_rect(
+    data = ~subset(.x, overlap_index >= threshold),
+    aes(xmin = month - 0.5, xmax = month + 0.5,
+        ymin = 0, ymax = 1),
+    fill = "purple", alpha = 0.15, inherit.aes = FALSE
+  ) +
+  geom_smooth(aes(y = tick_norm), color = "darkgreen", se = FALSE) +
+  geom_smooth(aes(y = human_norm), color = "red", se = FALSE) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    x = "Month",
+    y = "Normalized intensity (0–1)",
+    title = "Months with high tick–human activity overlap"
+  ) +
+  theme_minimal()
+
+
+normalized %>%
+  ggplot(aes(x = as.integer(month))) +
+  geom_smooth(aes(y = overlap_index), color = "purple", se = FALSE) +
+  facet_wrap(~ district) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    x = "Month",
+    y = "Overlap index (0–1)",
+    title = "Seasonal tick–human overlap by district"
+  ) +
+  theme_minimal(base_size = 12)
+
+normalized %>%
+  ggplot(aes(x = as.integer(month), y = overlap_index)) +
+  stat_smooth(
+    geom = "area",
+    method = "loess",
+    fill = "purple",
+    alpha = 0.35,
+    color = NA
+  ) +
+  geom_smooth(
+    method = "loess",
+    color = "purple",
+    linewidth = 1
+  ) +
+  facet_wrap(~ district) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    x = "Month",
+    y = "Overlap index (0–1)",
+    title = "Seasonal tick–human overlap by district"
+  ) +
+  theme_minimal(base_size = 12) +
+  ylim(0, NA)
+
+
+
+```
+
+another version of highlighting overlap
+```{r}
+library(dplyr)
+
+monthly_overlap <- normalized %>%
+  filter(district == "Bay Area District") %>%
+  group_by(month) %>%
+  summarise(
+    overlap_mean = mean(overlap_index, na.rm = TRUE),
+    tick_mean = mean(tick_norm, na.rm = TRUE),
+    human_mean = mean(human_norm, na.rm = TRUE)
+  )
+
+threshold <- quantile(monthly_overlap$overlap_mean, 0.75, na.rm = TRUE)
+
+ggplot(monthly_overlap, aes(x = as.integer(month))) +
+  geom_rect(
+    data = subset(monthly_overlap, overlap_mean >= threshold),
+    aes(
+      xmin = month - 0.5,
+      xmax = month + 0.5,
+      ymin = 0,
+      ymax = 1
+    ),
+    fill = "purple",
+    alpha = 0.15,
+    inherit.aes = FALSE
+  ) +
+  geom_smooth(aes(y = tick_mean), color = "darkgreen", se = FALSE) +
+  geom_smooth(aes(y = human_mean), color = "red", se = FALSE) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    x = "Month",
+    y = "Normalized intensity (0–1)",
+    title = "Months with high tick–human activity overlap",
+    subtitle = "Shaded months indicate top-quartile overlap"
+  ) +
+  theme_minimal()
+
+
+
+monthly_overlap <- normalized %>%
+  filter(district == "Sierra District") %>%
+  group_by(month) %>%
+  summarise(
+    overlap_mean = mean(overlap_index, na.rm = TRUE),
+    tick_mean = mean(tick_norm, na.rm = TRUE),
+    human_mean = mean(human_norm, na.rm = TRUE)
+  )
+
+threshold <- quantile(monthly_overlap$overlap_mean, 0.75, na.rm = TRUE)
+
+ggplot(monthly_overlap, aes(x = as.integer(month))) +
+  geom_rect(
+    data = subset(monthly_overlap, overlap_mean >= threshold),
+    aes(
+      xmin = month - 0.5,
+      xmax = month + 0.5,
+      ymin = 0,
+      ymax = 1
+    ),
+    fill = "purple",
+    alpha = 0.15,
+    inherit.aes = FALSE
+  ) +
+  geom_smooth(aes(y = tick_mean), color = "darkgreen", se = FALSE) +
+  geom_smooth(aes(y = human_mean), color = "red", se = FALSE) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    x = "Month",
+    y = "Normalized intensity (0–1)",
+    title = "Months with high tick–human activity overlap",
+    subtitle = "Shaded months indicate top-quartile overlap"
+  ) +
+  theme_minimal()
+
+
+```
+
+
+```{r}
+library(broom)
+
+smooth_df <- normalized %>%
+  filter(district == "Bay Area District") %>%
+  mutate(month_num = as.integer(month))
+
+loess_fit <- loess(overlap_index ~ month_num, data = smooth_df)
+
+smooth_df$overlap_smooth <- predict(loess_fit, smooth_df$month_num)
+
+threshold <- quantile(smooth_df$overlap_smooth, 0.75, na.rm = TRUE)
+
+plot1 <- ggplot(smooth_df, aes(x = month_num)) +
+  geom_rect(
+    data = subset(smooth_df, overlap_smooth >= threshold),
+    aes(
+      xmin = month_num - 0.5,
+      xmax = month_num + 0.5,
+      ymin = 0,
+      ymax = 1
+    ),
+    fill = "purple",
+    alpha = 0.15,
+    inherit.aes = FALSE
+  ) +
+  geom_smooth(aes(y = tick_norm), color = "darkgreen", se = FALSE) +
+  geom_smooth(aes(y = human_norm), color = "red", se = FALSE) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    x = "Month",
+    y = "Normalized intensity (0–1)",
+    title = "High-overlap months based on smoothed joint risk"
+  ) +
+  theme_minimal()
+
+
+
+smooth_df <- normalized %>%
+  filter(district == "Sierra District") %>%
+  mutate(month_num = as.integer(month))
+
+loess_fit <- loess(overlap_index ~ month_num, data = smooth_df)
+
+smooth_df$overlap_smooth <- predict(loess_fit, smooth_df$month_num)
+
+threshold <- quantile(smooth_df$overlap_smooth, 0.75, na.rm = TRUE)
+
+ggplot(smooth_df, aes(x = month_num)) +
+  geom_rect(
+    data = subset(smooth_df, overlap_smooth >= threshold),
+    aes(
+      xmin = month_num - 0.5,
+      xmax = month_num + 0.5,
+      ymin = 0,
+      ymax = 1
+    ),
+    fill = "purple",
+    alpha = 0.15,
+    inherit.aes = FALSE
+  ) +
+  geom_smooth(aes(y = tick_norm), color = "darkgreen", se = FALSE) +
+  geom_smooth(aes(y = human_norm), color = "red", se = FALSE) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    x = "Month",
+    y = "Normalized intensity (0–1)",
+    title = "High-overlap months based on smoothed joint risk"
+  ) +
+  theme_minimal()
+
+
+
+smooth_df <- normalized %>%
+  filter(district == "Ocotillo Wells District") %>%
+  mutate(month_num = as.integer(month))
+
+loess_fit <- loess(overlap_index ~ month_num, data = smooth_df)
+
+smooth_df$overlap_smooth <- predict(loess_fit, smooth_df$month_num)
+
+threshold <- quantile(smooth_df$overlap_smooth, 0.75, na.rm = TRUE)
+
+ggplot(smooth_df, aes(x = as.integer(month_num))) +
+  geom_rect(
+    data = subset(smooth_df, overlap_smooth >= threshold),
+    aes(
+      xmin = month_num - 0.5,
+      xmax = month_num + 0.5,
+      ymin = 0,
+      ymax = 1
+    ),
+    fill = "purple",
+    alpha = 0.15,
+    inherit.aes = FALSE
+  ) +
+  geom_smooth(aes(y = tick_norm), color = "darkgreen", se = FALSE) +
+  geom_smooth(aes(y = human_norm), color = "red", se = FALSE) +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    x = "Month",
+    y = "Normalized intensity (0–1)",
+    title = "High-overlap months based on smoothed joint risk"
+  ) +
+  theme_minimal() +
+  scale_x_continuous(
+  breaks = 1:12,
+  minor_breaks = NULL
+)
+
+
+```
+
+
+another
+```{r}
+library(dplyr)
+
+monthly_overlap <- normalized %>%
+  filter(district == "Bay Area District") %>%
+  group_by(month) %>%
+  summarise(
+    tick_mean = mean(tick_norm, na.rm = TRUE),
+    human_mean = mean(human_norm, na.rm = TRUE),
+    overlap_mean = mean(overlap_index, na.rm = TRUE)
+  ) %>%
+  arrange(month)
+
+tick_min <- 0.1   # choose based on ecology / model calibration
+
+monthly_overlap <- monthly_overlap %>%
+  mutate(overlap_filtered =
+           ifelse(tick_mean >= tick_min, overlap_mean, 0))
+
+target_prop <- 0.5   # 80% of annual overlap
+
+monthly_overlap <- monthly_overlap %>%
+  arrange(desc(overlap_filtered)) %>%
+  mutate(
+    overlap_prop = overlap_filtered / sum(overlap_filtered, na.rm = TRUE),
+    cum_overlap = cumsum(overlap_prop),
+    high_risk = cum_overlap <= target_prop
+  ) %>%
+  arrange(month)
+
+plot1 <- ggplot(monthly_overlap, aes(x = as.integer(month))) +
+  geom_rect(
+    data = subset(monthly_overlap, high_risk),
+    aes(
+      xmin = month - 0.5,
+      xmax = month + 0.5,
+      ymin = 0,
+      ymax = 1
+    ),
+    fill = "purple",
+    alpha = 0.15,
+    inherit.aes = FALSE
+  ) +
+  geom_smooth(aes(y = tick_mean), color = "red", se = FALSE) +
+  geom_smooth(aes(y = human_mean), color = "darkgreen", se = FALSE) +
+  scale_x_continuous(breaks = 1:12, minor_breaks = NULL) +
+  labs(
+    x = "Month",
+    y = "Normalized intensity (0–1)",
+    title = "High-risk months based on cumulative tick–human overlap",
+    subtitle = paste0(
+      "Shaded months account for ",
+      target_prop * 100,
+      "% of annual overlap (tick suitability ≥ ",
+      tick_min,
+      ")"
+    )
+  ) +
+  theme_minimal()
+
+
+
+monthly_overlap <- normalized %>%
+  filter(district == "Sierra District") %>%
+  group_by(month) %>%
+  summarise(
+    tick_mean = mean(tick_norm, na.rm = TRUE),
+    human_mean = mean(human_norm, na.rm = TRUE),
+    overlap_mean = mean(overlap_index, na.rm = TRUE)
+  ) %>%
+  arrange(month)
+
+#tick_min <- 0.3   # choose based on ecology / model calibration
+
+monthly_overlap <- monthly_overlap %>%
+  mutate(overlap_filtered =
+           ifelse(tick_mean >= tick_min, overlap_mean, 0))
+
+#target_prop <- 0.8   # 80% of annual overlap
+
+monthly_overlap <- monthly_overlap %>%
+  arrange(desc(overlap_filtered)) %>%
+  mutate(
+    overlap_prop = overlap_filtered / sum(overlap_filtered, na.rm = TRUE),
+    cum_overlap = cumsum(overlap_prop),
+    high_risk = cum_overlap <= target_prop
+  ) %>%
+  arrange(month)
+
+plot2 <- ggplot(monthly_overlap, aes(x = as.integer(month))) +
+  geom_rect(
+    data = subset(monthly_overlap, high_risk),
+    aes(
+      xmin = month - 0.5,
+      xmax = month + 0.5,
+      ymin = 0,
+      ymax = .2
+    ),
+    fill = "purple",
+    alpha = 0.15,
+    inherit.aes = FALSE
+  ) +
+  geom_smooth(aes(y = tick_mean), color = "red", se = FALSE) +
+  geom_smooth(aes(y = human_mean), color = "darkgreen", se = FALSE) +
+  scale_x_continuous(breaks = 1:12, minor_breaks = NULL) +
+  labs(
+    x = "Month",
+    y = "Normalized intensity (0–1)",
+    title = "High-risk months based on cumulative tick–human overlap",
+    subtitle = paste0(
+      "Shaded months account for ",
+      target_prop * 100,
+      "% of annual overlap (tick suitability ≥ ",
+      tick_min,
+      ")"
+    )
+  ) +
+  theme_minimal()
+
+
+
+
+monthly_overlap <- normalized %>%
+  filter(district == "Orange Coast District") %>%
+  group_by(month) %>%
+  summarise(
+    tick_mean = mean(tick_norm, na.rm = TRUE),
+    human_mean = mean(human_norm, na.rm = TRUE),
+    overlap_mean = mean(overlap_index, na.rm = TRUE)
+  ) %>%
+  arrange(month)
+
+#tick_min <- 0.3   # choose based on ecology / model calibration
+
+monthly_overlap <- monthly_overlap %>%
+  mutate(overlap_filtered =
+           ifelse(tick_mean >= tick_min, overlap_mean, 0))
+
+#target_prop <- 0.8   # 80% of annual overlap
+
+monthly_overlap <- monthly_overlap %>%
+  arrange(desc(overlap_filtered)) %>%
+  mutate(
+    overlap_prop = overlap_filtered / sum(overlap_filtered, na.rm = TRUE),
+    cum_overlap = cumsum(overlap_prop),
+    high_risk = cum_overlap <= target_prop
+  ) %>%
+  arrange(month)
+
+plot3 <- ggplot(monthly_overlap, aes(x = as.integer(month))) +
+  geom_rect(
+    data = subset(monthly_overlap, high_risk),
+    aes(
+      xmin = month - 0.5,
+      xmax = month + 0.5,
+      ymin = 0,
+      ymax = 1
+    ),
+    fill = "purple",
+    alpha = 0.15,
+    inherit.aes = FALSE
+  ) +
+  geom_smooth(aes(y = tick_mean), color = "red", se = FALSE) +
+  geom_smooth(aes(y = human_mean), color = "darkgreen", se = FALSE) +
+  scale_x_continuous(breaks = 1:12, minor_breaks = NULL) +
+  labs(
+    x = "Month",
+    y = "Normalized intensity (0–1)",
+    title = "High-risk months based on cumulative tick–human overlap",
+    subtitle = paste0(
+      "Shaded months account for ",
+      target_prop * 100,
+      "% of annual overlap (tick suitability ≥ ",
+      tick_min,
+      ")"
+    )
+  ) +
+  theme_minimal()
+
+
+
+
+
+monthly_overlap <- normalized %>%
+  filter(district == "Ocotillo Wells District") %>%
+  group_by(month) %>%
+  summarise(
+    tick_mean = mean(tick_norm, na.rm = TRUE),
+    human_mean = mean(human_norm, na.rm = TRUE),
+    overlap_mean = mean(overlap_index, na.rm = TRUE)
+  ) %>%
+  arrange(month)
+
+#tick_min <- 0.3   # choose based on ecology / model calibration
+
+monthly_overlap <- monthly_overlap %>%
+  mutate(overlap_filtered =
+           ifelse(tick_mean >= tick_min, overlap_mean, 0))
+
+#target_prop <- 0.8   # 80% of annual overlap
+
+monthly_overlap <- monthly_overlap %>%
+  arrange(desc(overlap_filtered)) %>%
+  mutate(
+    overlap_prop = overlap_filtered / sum(overlap_filtered, na.rm = TRUE),
+    cum_overlap = cumsum(overlap_prop),
+    high_risk = cum_overlap <= target_prop
+  ) %>%
+  arrange(month)
+
+plot4 <- ggplot(monthly_overlap, aes(x = as.integer(month))) +
+  geom_rect(
+    data = subset(monthly_overlap, high_risk),
+    aes(
+      xmin = month - 0.5,
+      xmax = month + 0.5,
+      ymin = 0,
+      ymax = 1
+    ),
+    fill = "purple",
+    alpha = 0.15,
+    inherit.aes = FALSE
+  ) +
+  geom_smooth(aes(y = tick_mean), color = "red", se = FALSE) +
+  geom_smooth(aes(y = human_mean), color = "darkgreen", se = FALSE) +
+  scale_x_continuous(breaks = 1:12, minor_breaks = NULL) +
+  labs(
+    x = "Month",
+    y = "Normalized intensity (0–1)",
+    title = "High-risk months based on cumulative tick–human overlap",
+    subtitle = paste0(
+      "Shaded months account for ",
+      target_prop * 100,
+      "% of annual overlap (tick suitability ≥ ",
+      tick_min,
+      ")"
+    )
+  ) +
+  theme_minimal()
+
+
+#ggarrange(plot1, plot2, plot3, ncol = 1,
+#          labels = c("Bay Area", "Sierras", "Coachella"))
+
+
+# Example: adding right-hand side label inside plot
+plot1 <- plot1 + 
+  annotate("text", x = 7.5, y = .5, label = "Bay Area", hjust = 0, size = 5)
+
+plot2 <- plot2 + 
+  annotate("text", x = 7.5, y = .2, label = "Sierras", hjust = 0, size = 5) +
+  ggtitle("", subtitle = "")
+
+plot3 <- plot3 + 
+  annotate("text", x = 7.5, y = .5, label = "Orange Coast", hjust = 0, size = 5)+
+  ggtitle("", subtitle = "")
+
+plot4 <- plot4 + 
+  annotate("text", x = 7.5, y = .5, label = "Coachella", hjust = 0, size = 5)+
+  ggtitle("", subtitle = "")
+
+# Then arrange
+ggarrange(plot1 , plot2, plot3, plot4, ncol = 1)
+
+
+ggarrange(plot1 , plot2, plot3, plot4, nrow = 2, ncol = 2)
+```

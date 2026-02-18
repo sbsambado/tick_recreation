@@ -1,0 +1,297 @@
+---
+title: "DataCleaning_MetaPipeline_20260127"
+output: html_document
+date: "2026-01-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(googledrive)
+library(readr)
+library(data.table)
+library(purrr)
+library(dplyr)
+library(sf)
+library(terra)
+library(stringr)
+library(lubridate)
+
+
+#drive_deauth()
+#options(googledrive_quiet = FALSE)
+#drive_auth(cache = FALSE, scopes = "https://www.googleapis.com/auth/drive")
+
+# GPW raster
+gpw_path <- "data/raw/humanpop_count/gpw_v4_population_count_rev11_2015_2pt5_min.tif"
+gpw <- rast(gpw_path)
+
+# CA bounding box
+lat_min <- 32.3
+lat_max <- 42.1
+lon_min <- -125
+lon_max <- -114
+
+# tile zoom level (optional)
+zoom <- 13
+
+
+# Output folder for intermediate filtered CSVs & tile RDS
+dir.create("data/processed/meta_activitymaps_filtered", showWarnings = FALSE)
+dir.create("data/processed/meta_activitymaps_tiles", showWarnings = FALSE)
+
+```
+
+
+
+download files from google drive
+
+```{r}
+temp_dir <- tempdir()  # creates a system temp folder
+dir.create(temp_dir, showWarnings = FALSE)
+
+# List CSVs in your Drive folder
+folder_id <- "1bIdZiuj5GOXgti4_DE-Qs9cvp9voL0vj"
+folder <- drive_get(as_id(folder_id))
+
+
+csv_files <- drive_ls(folder, pattern = "\\.csv$")
+# fix spaces in the names 
+csv_files$name <- str_replace_all(csv_files$name, "[[:space:]]+", "_")  # replace spaces with _
+csv_paths <- file.path(temp_dir, csv_files$name)
+
+
+# Download CSVs one at a time into temp folder
+walk2(
+  csv_files$id, csv_files$name,
+  ~drive_download(
+    as_id(.x),
+    path = file.path(temp_dir, .y),
+    overwrite = TRUE
+  )
+)
+
+
+
+# Get paths to temp CSVs
+csv_paths <- file.path(temp_dir, csv_files$name)
+
+
+#walk(csv_paths, process_csv)  # process_csv is your memory-safe function
+
+```
+
+
+
+another attempt
+```{r}
+library(googledrive)
+library(data.table)
+library(dplyr)
+library(sf)
+library(terra)
+library(purrr)
+library(stringr)
+
+# -----------------------
+# PARAMETERS
+# -----------------------
+
+folder_id <- "1bIdZiuj5GOXgti4_DE-Qs9cvp9voL0vj"
+chunk_size <- 500000  # lines to read at a time
+zoom <- 13
+
+lat_min <- 32.3
+lat_max <- 42.1
+lon_min <- -125
+lon_max <- -114
+
+# Paths
+csv_temp_dir <- "data/temp/meta_csvs"
+dir.create(csv_temp_dir, recursive = TRUE, showWarnings = FALSE)
+
+tile_output_dir <- "data/processed/meta_activitymaps_tiles"
+dir.create(tile_output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Load GPW raster (population counts)
+gpw_path <- "data/raw/humanpop_count/gpw_v4_population_count_rev11_2015_2pt5_min.tif"
+gpw <- rast(gpw_path)
+
+# -----------------------
+# HELPER FUNCTIONS
+# -----------------------
+
+tile_bbox <- function(xtile, ytile, zoom) {
+  n <- 2^zoom
+  lon_deg <- function(x) x / n * 360 - 180
+  lat_deg <- function(y) atan(sinh(pi * (1 - 2 * y / n))) * 180 / pi
+  list(
+    xmin = lon_deg(xtile),
+    xmax = lon_deg(xtile + 1),
+    ymin = lat_deg(ytile + 1),
+    ymax = lat_deg(ytile)
+  )
+}
+
+process_csv_file_by_record <- function(input_file) {
+  
+  message("Processing: ", basename(input_file))
+  
+  # -----------------------
+  # FILTER CSV IN CHUNKS (memory safe)
+  # -----------------------
+  
+  filtered_file <- file.path(csv_temp_dir,
+                             paste0("filtered_", basename(input_file)))
+  if(file.exists(filtered_file)) file.remove(filtered_file)
+  
+  con <- file(input_file, "r")
+  header <- readLines(con, n = 1)
+  
+  while(length(chunk_lines <- readLines(con, n = chunk_size)) > 0) {
+    chunk <- fread(paste(c(header, chunk_lines), collapse = "\n"))
+    
+    chunk_filtered <- chunk[
+      visit_latitude >= lat_min & visit_latitude <= lat_max &
+        visit_longitude >= lon_min & visit_longitude <= lon_max &
+        day_or_night == "daytime"
+    ]
+    
+    if(nrow(chunk_filtered) > 0) {
+      fwrite(chunk_filtered, filtered_file, append = TRUE)
+    }
+  }
+  close(con)
+  
+  # Load filtered CSV
+  dt <- fread(filtered_file)
+  if(nrow(dt) == 0) return(NULL)
+  
+  # -----------------------
+  # COMPUTE HOME POPULATION
+  # -----------------------
+  
+  home_coords <- dt %>%
+    distinct(home_latitude, home_longitude) %>%
+    mutate(
+      home_lat_round = round(home_latitude, 5),
+      home_lon_round = round(home_longitude, 5)
+    )
+  
+  home_sf <- st_as_sf(home_coords,
+                      coords = c("home_lon_round", "home_lat_round"),
+                      crs = 4326)
+  home_sf_proj <- st_transform(home_sf, crs(gpw))
+  home_sf_proj$home_population <- terra::extract(gpw, vect(home_sf_proj))[,2]
+  
+  dt <- dt %>%
+    mutate(
+      home_lat_round = round(home_latitude, 5),
+      home_lon_round = round(home_longitude, 5)
+    ) %>%
+    left_join(home_sf_proj %>% st_drop_geometry() %>% 
+                select(home_lat_round, home_lon_round, home_population),
+              by = c("home_lat_round", "home_lon_round")) %>%
+    mutate(
+      home_population = ifelse(is.na(home_population), 0, home_population),
+      weighted_activity = home_population * visit_fraction
+    )
+  
+  # -----------------------
+  # PROCESS EACH 3-WEEK RECORD
+  # -----------------------
+  
+  records <- unique(dt$ds)
+  message("Found ", length(records), " 3-week records")
+  
+  record_tiles <- map(records, function(rec) {
+    
+    dt_rec <- dt %>% filter(ds == rec)
+    
+    # Aggregate per visit pixel
+    activity_summary <- dt_rec %>%
+      group_by(visit_latitude, visit_longitude) %>%
+      summarise(total_weighted_activity = sum(weighted_activity, na.rm = TRUE), .groups = "drop")
+    
+    # Convert to tile indices
+    n <- 2^zoom
+    xtile <- floor((activity_summary$visit_longitude + 180) / 360 * n)
+    ytile <- floor((1 - log(tan(activity_summary$visit_latitude * pi / 180) + 
+                              1 / cos(activity_summary$visit_latitude * pi / 180)) / pi) / 2 * n)
+    
+    tile_activity <- activity_summary %>%
+      mutate(xtile = xtile, ytile = ytile) %>%
+      group_by(xtile, ytile) %>%
+      summarise(activity = sum(total_weighted_activity, na.rm = TRUE), .groups = "drop")
+    
+    # Build tile polygons
+    xmin <- tile_activity$xtile / n * 360 - 180
+    xmax <- (tile_activity$xtile + 1) / n * 360 - 180
+    lat_deg <- function(y) atan(sinh(pi * (1 - 2 * y / n))) * 180 / pi
+    ymin <- lat_deg(tile_activity$ytile + 1)
+    ymax <- lat_deg(tile_activity$ytile)
+    
+    polygons <- purrr::pmap(list(xmin, xmax, ymin, ymax), function(xmin, xmax, ymin, ymax) {
+      st_polygon(list(matrix(c(
+        xmin, ymin,
+        xmax, ymin,
+        xmax, ymax,
+        xmin, ymax,
+        xmin, ymin
+      ), ncol = 2, byrow = TRUE)))
+    })
+    
+    tile_sf <- st_sf(tile_activity, geometry = st_sfc(polygons, crs = 4326)) %>%
+      mutate(ds = rec)
+    
+    # Save per record (optional)
+    out_rds <- file.path(tile_output_dir,
+                         paste0(tools::file_path_sans_ext(basename(input_file)), "_", rec, "_tiles.rds"))
+    saveRDS(tile_sf, out_rds)
+    
+    # Clear memory
+    rm(tile_sf); gc()
+    
+    return(out_rds)
+  })
+  
+  return(record_tiles)
+}
+
+# -----------------------
+# DOWNLOAD & PROCESS ONE CSV AT A TIME
+# -----------------------
+
+folder <- drive_get(as_id(folder_id))
+csv_files <- drive_ls(folder, pattern = "\\.csv$")
+csv_files$name <- str_replace_all(csv_files$name, "[[:space:]]+", "_")  # fix spaces
+
+all_tiles_files <- list()
+
+for(i in seq_len(nrow(csv_files))) {
+  
+  csv_name <- csv_files$name[i]
+  csv_id <- csv_files$id[i]
+  
+  local_file <- file.path(csv_temp_dir, csv_name)
+  
+  if(!file.exists(local_file)) {
+    message("Downloading: ", csv_name)
+    drive_download(as_id(csv_id),
+                   path = local_file,
+                   overwrite = TRUE)
+  }
+  
+  # Process CSV
+  record_rds <- process_csv_file_by_record(local_file)
+  all_tiles_files <- c(all_tiles_files, record_rds)
+  
+  # Optional: remove CSV to free disk space
+  # file.remove(local_file)
+  
+  # Clear memory
+  gc()
+}
+
+
+```

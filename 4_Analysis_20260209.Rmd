@@ -1,0 +1,967 @@
+---
+title: "4_Analysis_20260209"
+output: html_document
+date: "2026-02-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(spdep)
+library(spatialreg)
+library(INLA)
+library(stringr)
+library(tidyverse)
+library(sf)
+library(stringr)
+library(sp)
+```
+
+```{r}
+################################################################################
+# BYM2 MODELS FOR LYME DISEASE RISK
+# Three models testing different spatial scales of human-tick overlap
+################################################################################
+
+library(INLA)
+library(sf)
+library(spdep)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(stringr)
+
+################################################################################
+# STEP 1: LOAD AND PREPARE BASE DATA
+################################################################################
+
+# Load base spatial data
+zipcode_shp <- st_read("data/processed/zipcode_fulldata_annual.gpkg") %>%
+  st_make_valid() %>%
+  mutate(zip_code = str_pad(as.character(zip_code), 5, "left", "0")) %>%
+  arrange(zip_code) %>%
+  rename(geometry = geom) %>%
+  mutate(zip_id = row_number())
+
+# Load population data
+ca_total_pop <- read.delim("data/raw/cademographics_totalpop.csv") %>%
+  mutate(zip_code = str_pad(as.character(zip_code), 5, "left", "0"))
+
+# Load zip-level activity (Meta data)
+zip_activity <- read.csv("data/processed/meta_annual_zip.csv") %>%
+  dplyr::select(-X) %>%
+  rename(zip_code = ZIP_CODE) %>%
+  mutate(zip_code = str_pad(as.character(zip_code), 5, "left", "0"))
+
+# Load zip-level tick infectivity
+zip_tick_inf <- read.csv("data/processed/zip_tick_inf_distinct.csv") %>%
+  mutate(zip_code = str_pad(as.character(zip_code), 5, "left", "0"))
+
+# Load state park (CASP) activity
+data_clean_analysis_monthly <- read.csv("data/processed/data_clean_analysis_monthly.csv")
+
+casp_activity <- data_clean_analysis_monthly %>%
+  dplyr::select(UNITNAME, ZIP_CODE, activity_annualtotal_incasp) %>%
+  group_by(ZIP_CODE) %>%
+  summarise(activity_annualtotal_incasp = mean(activity_annualtotal_incasp, na.rm = TRUE),
+            .groups = "drop") %>%
+  rename(zip_code = ZIP_CODE) %>%
+  mutate(zip_code = str_pad(as.character(zip_code), 5, "left", "0"))
+
+# Load state park tick infectivity
+casp_tick <- read.csv("data/processed/casp_ldi_tick_annualmonthly.csv") %>%
+  dplyr::select(UNITNAME, tick_year_inf) %>%
+  right_join(data_clean_analysis_monthly %>% dplyr::select(ZIP_CODE, UNITNAME)) %>%
+  rename(zip_code = ZIP_CODE) %>%
+  mutate(zip_code = str_pad(as.character(zip_code), 5, "left", "0")) %>%
+  group_by(zip_code) %>%
+  summarise(tick_year_inf_casp = mean(tick_year_inf, na.rm = TRUE), .groups = "drop")
+
+################################################################################
+# STEP 2: CREATE MASTER DATASET WITH ALL COVARIATES
+################################################################################
+
+zip_master <- zipcode_shp %>%
+  dplyr::select(zip_code, zip_id, ldi_cat, geometry) %>%
+  # Add population
+  left_join(ca_total_pop, by = "zip_code") %>%
+  mutate(total_pop = replace_na(total_pop, 1)) %>%  # Replace 0 with 1 to avoid log(0)
+  # Add zip-level activity
+  left_join(zip_activity %>% dplyr::select(zip_code, total_activity), by = "zip_code") %>%
+  rename(activity_zip = total_activity) %>%
+  mutate(activity_zip = replace_na(activity_zip, 0)) %>%
+  # Add zip-level tick infectivity
+  left_join(zip_tick_inf %>% dplyr::select(zip_code, tick_year_inf), by = "zip_code") %>%
+  rename(tick_inf_zip = tick_year_inf) %>%
+  mutate(tick_inf_zip = replace_na(tick_inf_zip, 0)) %>%
+  # Add state park activity
+  left_join(casp_activity, by = "zip_code") %>%
+  mutate(activity_casp = replace_na(activity_annualtotal_incasp, 0)) %>%
+  # Add state park tick infectivity
+  left_join(casp_tick, by = "zip_code") %>%
+  mutate(tick_inf_casp = replace_na(tick_year_inf_casp, 0)) %>%
+  # Create transformations and scaled variables
+  mutate(
+    # Log transform population (offset)
+    total_pop_clean = ifelse(total_pop == 0 | is.na(total_pop), 1, total_pop),
+    total_pop_log = log(total_pop_clean),
+    
+    # Log transform activities
+    activity_zip_log = log(activity_zip + 1),
+    activity_casp_log = log(activity_casp + 1),
+    
+    # Center (NOT scale - just subtract mean)
+    tick_inf_zip_c = tick_inf_zip - mean(tick_inf_zip, na.rm = TRUE),
+    tick_inf_casp_c = tick_inf_casp - mean(tick_inf_casp, na.rm = TRUE),
+    activity_zip_c = activity_zip_log - mean(activity_zip_log, na.rm = TRUE),
+    activity_casp_c = activity_casp_log - mean(activity_casp_log, na.rm = TRUE)
+  ) %>%
+  arrange(zip_code) %>%
+  mutate(zip_id = row_number())  # Ensure sequential IDs
+
+################################################################################
+# STEP 3: CREATE SPATIAL ADJACENCY STRUCTURE
+################################################################################
+
+# Create neighbor structure
+nb <- poly2nb(zip_master, queen = TRUE)
+
+# Check for islands
+islands <- which(card(nb) == 0)
+cat("Found", length(islands), "islands (zip codes with no neighbors)\n")
+
+# Fix islands by connecting to nearest neighbor
+if(length(islands) > 0) {
+  coords <- st_coordinates(st_centroid(zip_master))
+  for(i in islands) {
+    dists <- spDists(coords[i, , drop = FALSE], coords[-i, ])
+    nearest <- which.min(dists)
+    nb[[i]] <- nearest
+    nb[[nearest]] <- sort(c(nb[[nearest]], i))
+  }
+  cat("Connected islands to nearest neighbors\n")
+}
+
+# Verify no more islands
+if(any(card(nb) == 0)) {
+  stop("Still have islands after fixing!")
+}
+
+# Convert to INLA format
+nb2INLA("zip_adj.graph", nb)
+g <- inla.read.graph("zip_adj.graph")
+
+################################################################################
+# STEP 4: PREPARE DATA FOR EACH MODEL
+################################################################################
+
+# MODEL 1: Everything at zip-code level
+data_model1 <- data.frame(
+  Y = zip_master$ldi_cat,
+  offset = zip_master$total_pop_log,
+  area_id = zip_master$zip_id,
+  tick_suit = zip_master$tick_inf_zip,
+  activity = zip_master$activity_zip
+)
+
+# MODEL 2: Zip-level tick suitability × State park activity
+data_model2 <- data.frame(
+  Y = zip_master$ldi_cat,
+  offset = zip_master$total_pop_log,
+  area_id = zip_master$zip_id,
+  tick_suit = zip_master$tick_inf_zip,
+  activity = zip_master$activity_casp
+)
+
+# MODEL 3: Both tick and activity at state park level
+data_model3 <- data.frame(
+  Y = zip_master$ldi_cat,
+  offset = zip_master$total_pop_log,
+  area_id = zip_master$zip_id,
+  tick_suit = zip_master$tick_inf_casp,
+  activity = zip_master$activity_casp
+)
+
+# Data quality checks
+cat("\n=== DATA QUALITY CHECKS ===\n")
+for(i in 1:3) {
+  data_name <- paste0("data_model", i)
+  data_obj <- get(data_name)
+  cat("\n", data_name, ":\n")
+  cat("  N observations:", nrow(data_obj), "\n")
+  cat("  Missing values:", sum(is.na(data_obj)), "\n")
+  cat("  Negative counts:", sum(data_obj$Y < 0), "\n")
+  cat("  Zero counts:", sum(data_obj$Y == 0), "\n")
+  cat("  Mean Y:", round(mean(data_obj$Y), 2), "\n")
+  cat("  Var Y:", round(var(data_obj$Y), 2), "\n")
+}
+
+################################################################################
+# STEP 5: DEFINE MODEL FORMULA
+################################################################################
+
+# Same formula for all models - interaction between tick and activity
+formula_bym2 <- Y ~ 1 + tick_suit * activity +
+  f(area_id, model = "bym2", graph = g, scale.model = TRUE,
+    hyper = list(
+      prec = list(prior = "pc.prec", param = c(1, 0.01)),
+      phi = list(prior = "pc", param = c(0.5, 0.5))
+    ))
+
+################################################################################
+# STEP 6: FIT ALL MODELS
+################################################################################
+
+cat("\n=== FITTING MODELS ===\n")
+
+# Model 1: Zip-level tick × Zip-level activity
+cat("\nFitting Model 1 (Zip tick × Zip activity)...\n")
+model1 <- inla(formula_bym2,
+               family = "nbinomial", #"poisson",
+               data = data_model1,
+               offset = offset,
+               control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+               control.inla = list(strategy = "simplified.laplace"))
+
+# Model 2: Zip-level tick × State park activity
+cat("Fitting Model 2 (Zip tick × Park activity)...\n")
+model2 <- inla(formula_bym2,
+               family = "nbinomial", #"poisson",
+               data = data_model2,
+               offset = offset,
+               control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+               control.inla = list(strategy = "simplified.laplace"), verbose = TRUE)
+
+# Model 3: State park tick × State park activity
+cat("Fitting Model 3 (Park tick × Park activity)...\n")
+model3 <- inla(formula_bym2,
+               family = "nbinomial", #"poisson",
+               data = data_model3,
+               offset = offset,
+               control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE, config = TRUE),
+               control.inla = list(strategy = "simplified.laplace"))
+
+################################################################################
+# STEP 7: EXTRACT AND COMPARE RESULTS
+################################################################################
+
+cat("\n=== MODEL COMPARISON ===\n")
+
+# Function to extract key results
+extract_results <- function(model, model_name) {
+  fixed <- model$summary.fixed
+  hyper <- model$summary.hyperpar
+  
+  list(
+    model = model_name,
+    # Fixed effects
+    intercept = fixed["(Intercept)", "mean"],
+    tick_beta = fixed["tick_suit", "mean"],
+    tick_rr = exp(fixed["tick_suit", "mean"]),
+    tick_ci_lower = fixed["tick_suit", "0.025quant"],
+    tick_ci_upper = fixed["tick_suit", "0.975quant"],
+    activity_beta = fixed["activity", "mean"],
+    activity_rr = exp(fixed["activity", "mean"]),
+    activity_ci_lower = fixed["activity", "0.025quant"],
+    activity_ci_upper = fixed["activity", "0.975quant"],
+    interaction_beta = fixed["tick_suit:activity", "mean"],
+    interaction_ci_lower = fixed["tick_suit:activity", "0.025quant"],
+    interaction_ci_upper = fixed["tick_suit:activity", "0.975quant"],
+    interaction_sig = (fixed["tick_suit:activity", "0.025quant"] > 0 | 
+                       fixed["tick_suit:activity", "0.975quant"] < 0),
+    # Spatial params
+    phi = hyper["Phi for area_id", "mean"],
+    precision = hyper["Precision for area_id", "mean"],
+    # Model fit
+    dic = model$dic$dic,
+    waic = model$waic$waic
+  )
+}
+
+# Extract results for all models
+results1 <- extract_results(model1, "Model 1: Zip × Zip")
+results2 <- extract_results(model2, "Model 2: Zip × Park")
+results3 <- extract_results(model3, "Model 3: Park × Park")
+
+# Create comparison table
+comparison <- bind_rows(results1, results2, 
+                        results3)
+
+# Print comparison table
+cat("\n=== FIXED EFFECTS COMPARISON ===\n")
+print(comparison %>% 
+  dplyr::select(model, tick_rr, activity_rr, interaction_beta, 
+                interaction_sig, dic, waic) %>%
+  mutate(across(where(is.numeric), ~round(., 3))))
+
+cat("\n=== DETAILED INTERACTION RESULTS ===\n")
+for(i in 1:3) {
+  res <- get(paste0("results", i))
+  cat("\n", res$model, ":\n")
+  cat("  Interaction β:", round(res$interaction_beta, 4), "\n")
+  cat("  95% CI: [", round(res$interaction_ci_lower, 4), ",", 
+      round(res$interaction_ci_upper, 4), "]\n")
+  cat("  Significant:", res$interaction_sig, "\n")
+}
+
+################################################################################
+# STEP 8: VISUALIZATION - COEFFICIENT PLOTS
+################################################################################
+
+# Create coefficient plot for all models
+plot_coefficients <- function(model_list, model_names) {
+  
+  coef_data <- lapply(seq_along(model_list), function(i) {
+    fixed <- model_list[[i]]$summary.fixed[-1, ]  # Remove intercept
+    data.frame(
+      model = model_names[i],
+      term = rownames(fixed),
+      beta = fixed$mean,
+      lower = fixed$`0.025quant`,
+      upper = fixed$`0.975quant`
+    )
+  }) %>% bind_rows()
+  
+  # Clean up term names
+  coef_data$term <- factor(coef_data$term,
+                           levels = c("tick_suit:activity", "activity", "tick_suit"),
+                           labels = c("Tick × Activity", "Human Activity", "Tick Suitability"))
+  
+  ggplot(coef_data, aes(x = beta, y = term, color = model)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    geom_errorbarh(aes(xmin = lower, xmax = upper), 
+                   position = position_dodge(width = 0.5),
+                   height = 0.2, linewidth = 1) +
+    geom_point(position = position_dodge(width = 0.5), size = 3) +
+    scale_color_manual(values = c("#E69F00", "#56B4E9", "#009E73")) +
+    labs(x = "Log Relative Risk (95% CI)", 
+         y = NULL,
+         title = "Fixed Effect Estimates Across Models",
+         color = "Model") +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.major.y = element_blank(),
+          legend.position = "bottom")
+}
+
+coef_plot <- plot_coefficients(list(model1, model2, model3),
+  c("Model 1: Zip × Zip", "Model 2: Zip × Park", "Model 3: Park × Park"))
+
+print(coef_plot)
+
+
+################################################################################
+# STEP 9: SAVE RESULTS
+################################################################################
+
+# Save model objects
+save(model1, model2, model3, zip_master, 
+     file = "results/bym2_lyme_models.RData")
+
+# Save comparison table
+write.csv(comparison, "results/model_comparison.csv", row.names = FALSE)
+
+# Save coefficient plot
+ggsave("results/coefficient_comparison.pdf", coef_plot, 
+       width = 10, height = 6)
+
+cat("\n=== ANALYSIS COMPLETE ===\n")
+cat("Results saved to results/ directory\n")
+
+################################################################################
+# STEP 10: INTERPRETATION HELPER
+################################################################################
+
+cat("\n=== INTERPRETATION GUIDE ===\n")
+
+best_model <- comparison[which.min(comparison$waic), ]
+cat("\nBest fitting model (lowest WAIC):", best_model$model, "\n")
+cat("WAIC:", round(best_model$waic, 2), "\n")
+
+if(best_model$interaction_sig) {
+  cat("\n✓ SIGNIFICANT INTERACTION found in best model!\n")
+  cat("  Interaction β =", round(best_model$interaction_beta, 3), "\n")
+  if(best_model$interaction_beta > 0) {
+    cat("  → Human activity's effect INCREASES with tick suitability\n")
+    cat("  → Supports hypothesis: overlap matters for Lyme risk\n")
+  } else {
+    cat("  → Human activity's effect DECREASES with tick suitability\n")
+    cat("  → Contradicts hypothesis\n")
+  }
+} else {
+  cat("\n✗ NO significant interaction in best model\n")
+  cat("  Interaction β =", round(best_model$interaction_beta, 3), 
+      " (95% CI:", round(best_model$interaction_ci_lower, 3), "to",
+      round(best_model$interaction_ci_upper, 3), ")\n")
+  cat("  → Effects appear independent\n")
+}
+
+cat("\nMain effects in best model:\n")
+cat("  Tick suitability RR:", round(best_model$tick_rr, 2), "\n")
+cat("  Human activity RR:", round(best_model$activity_rr, 2), "\n")
+cat("\nSpatial autocorrelation (phi):", round(best_model$phi, 3), "\n")
+if(best_model$phi > 0.7) {
+  cat("  → Strong spatial clustering\n")
+}
+
+print("Done!")
+
+```
+
+
+```{r}
+sum(zip_master$activity_casp == 0)
+sum(zip_master$activity_casp > 0)
+
+mean(zip_master$ldi_cat)
+var(zip_master$ldi_cat)
+```
+
+only do zipcodes with parks
+```{r}
+
+
+################################################################################
+# PARK-ONLY SUBSET: Filter and rebuild spatial structure
+################################################################################
+
+# Step 1: Filter to zip codes WITH state parks
+zip_parks <- zip_master %>%
+  filter(activity_casp > 0) %>%  # Only zip codes with parks (n=110)
+  arrange(zip_code)
+
+cat("Total zip codes:", nrow(zip_master), "\n")
+cat("Zip codes with parks:", nrow(zip_parks), "\n")
+cat("Lyme cases in park zip codes:", sum(zip_parks$ldi_cat), "\n")
+
+# Step 2: Recalculate centered variables for THIS SUBSET
+# (Important: means will be different for the 110 vs 1721 zip codes!)
+zip_parks <- zip_parks %>%
+  mutate(
+    # Recalculate means based on PARK SUBSET
+    tick_inf_zip_c = tick_inf_zip - mean(tick_inf_zip, na.rm = TRUE),
+    tick_inf_casp_c = tick_inf_casp - mean(tick_inf_casp, na.rm = TRUE),
+    activity_zip_c = activity_zip_log - mean(activity_zip_log, na.rm = TRUE),
+    activity_casp_c = activity_casp_log - mean(activity_casp_log, na.rm = TRUE),
+    
+    # Create NEW sequential IDs for INLA
+    park_id = row_number()  # 1, 2, 3... 110
+  )
+
+# Step 3: Build neighbor structure for park subset
+nb_parks <- poly2nb(zip_parks, queen = TRUE)
+summary(nb_parks)
+
+# Step 4: Check for and fix islands
+islands_parks <- which(card(nb_parks) == 0)
+cat("Islands in park subset:", length(islands_parks), "\n")
+
+if(length(islands_parks) > 0) {
+  cat("Fixing", length(islands_parks), "islands...\n")
+  coords <- st_coordinates(st_centroid(zip_parks))
+  
+  for(i in islands_parks) {
+    dists <- spDists(coords[i, , drop = FALSE], coords[-i, ])
+    nearest <- which.min(dists)
+    nb_parks[[i]] <- nearest
+    nb_parks[[nearest]] <- sort(c(nb_parks[[nearest]], i))
+  }
+  
+  # Verify fixed
+  if(any(card(nb_parks) == 0)) {
+    stop("Still have islands after fixing!")
+  }
+  cat("All islands connected\n")
+}
+
+# Step 5: Convert to INLA graph
+nb2INLA("zip_parks_adj.graph", nb_parks)
+g_parks <- inla.read.graph("zip_parks_adj.graph")
+
+cat("Park spatial graph created: n =", g_parks$n, "\n")
+
+################################################################################
+# PREPARE DATA FOR MODELS
+################################################################################
+
+# MODEL 1: All zip codes (n=1721)
+# Use original spatial structure
+data_model1 <- data.frame(
+  Y = zip_master$ldi_cat,
+  offset = zip_master$total_pop_log,
+  area_id = zip_master$zip_id,  # Sequential 1:1721
+  tick_suit = zip_master$tick_inf_zip,
+  activity = zip_master$activity_zip
+)
+
+# MODEL 2: Park zip codes only, zip-level tick × park activity (n=110)
+data_model2 <- zip_parks %>%
+  st_drop_geometry() %>%
+  transmute(
+    Y = ldi_cat,
+    offset = total_pop_log,
+    area_id = park_id,  # Sequential 1:110
+    tick_suit = tick_inf_zip,  # Zip-level tick (recalculated for subset)
+    activity = activity_casp   # Park activity (recalculated for subset)
+  )
+
+# MODEL 3: Park zip codes only, park tick × park activity (n=110)
+data_model3 <- zip_parks %>%
+  st_drop_geometry() %>%
+  transmute(
+    Y = ldi_cat,
+    offset = total_pop_log,
+    area_id = park_id,  # Sequential 1:110
+    tick_suit = tick_inf_casp,  # Park tick (recalculated for subset)
+    activity = activity_casp    # Park activity (recalculated for subset)
+  )
+
+# Verify data quality
+cat("\n=== DATA CHECKS ===\n")
+cat("Model 1: n =", nrow(data_model1), "| NAs =", sum(is.na(data_model1)), "\n")
+cat("Model 2: n =", nrow(data_model2), "| NAs =", sum(is.na(data_model2)), "\n")
+cat("Model 3: n =", nrow(data_model3), "| NAs =", sum(is.na(data_model3)), "\n")
+
+################################################################################
+# FIT MODELS
+################################################################################
+
+# Shared formula
+formula_bym2 <- Y ~ 1 + tick_suit * activity +
+  f(area_id, model = "bym2", graph = g, scale.model = TRUE,
+    hyper = list(
+      prec = list(prior = "pc.prec", param = c(1, 0.01)),
+      phi = list(prior = "pc", param = c(0.5, 0.5))
+    ))
+
+# Model 1: All zip codes
+cat("\nFitting Model 1 (All zip codes, n=1721)...\n")
+model1 <- inla(formula_bym2,
+               family = "nbinomial",
+               data = data_model1,
+               offset = offset,
+               control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+               control.inla = list(strategy = "simplified.laplace"))
+
+# Model 2: Park subset, zip tick × park activity
+cat("Fitting Model 2 (Park zip codes, n=110, zip tick × park activity)...\n")
+
+# Need to update formula to use park graph
+formula_bym2_parks <- Y ~ 1 + tick_suit * activity +
+  f(area_id, model = "bym2", graph = g_parks, scale.model = TRUE,
+    hyper = list(
+      prec = list(prior = "pc.prec", param = c(1, 0.01)),
+      phi = list(prior = "pc", param = c(0.5, 0.5))
+    ))
+
+model2 <- inla(formula_bym2_parks,
+               family = "nbinomial",
+               data = data_model2,
+               offset = offset,
+               control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+               control.inla = list(strategy = "simplified.laplace"))
+
+# Model 3: Park subset, park tick × park activity
+cat("Fitting Model 3 (Park zip codes, n=110, park tick × park activity)...\n")
+model3 <- inla(formula_bym2_parks,  # Same graph as Model 2
+               family = "nbinomial",
+               data = data_model3,
+               offset = offset,
+               control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+               control.inla = list(strategy = "simplified.laplace"))
+
+################################################################################
+# COMPARE RESULTS
+################################################################################
+
+cat("\n=== RESULTS ===\n")
+
+# Model 1
+cat("\nModel 1 (All zip codes):\n")
+print(model1$summary.fixed)
+cat("Phi:", model1$summary.hyperpar["Phi for area_id", "mean"], "\n")
+cat("WAIC:", model1$waic$waic, "\n")
+
+# Model 2
+cat("\nModel 2 (Park zips, zip tick × park activity):\n")
+print(model2$summary.fixed)
+cat("Phi:", model2$summary.hyperpar["Phi for area_id", "mean"], "\n")
+cat("WAIC:", model2$waic$waic, "\n")
+
+# Model 3
+cat("\nModel 3 (Park zips, park tick × park activity):\n")
+print(model3$summary.fixed)
+cat("Phi:", model3$summary.hyperpar["Phi for area_id", "mean"], "\n")
+cat("WAIC:", model3$waic$waic, "\n")
+
+
+```
+^^ gave best result
+
+make zips with no pakrs = -
+```{r}
+
+################################################################################
+# PARK-ONLY SUBSET: Filter and rebuild spatial structure
+################################################################################
+
+# Step 1: Filter to zip codes WITH state parks
+zip_parks <- zip_master %>%
+  filter(activity_casp >= 0) %>%  # Only zip codes with parks (n=110)
+  arrange(zip_code)
+
+cat("Total zip codes:", nrow(zip_master), "\n")
+cat("Zip codes with parks:", nrow(zip_parks), "\n")
+cat("Lyme cases in park zip codes:", sum(zip_parks$ldi_cat), "\n")
+
+# Step 2: Recalculate centered variables for THIS SUBSET
+# (Important: means will be different for the 110 vs 1721 zip codes!)
+zip_parks <- zip_parks %>%
+  mutate(
+    # Recalculate means based on PARK SUBSET
+    tick_inf_zip_c = tick_inf_zip - mean(tick_inf_zip, na.rm = TRUE),
+    tick_inf_casp_c = tick_inf_casp - mean(tick_inf_casp, na.rm = TRUE),
+    activity_zip_c = activity_zip_log - mean(activity_zip_log, na.rm = TRUE),
+    activity_casp_c = activity_casp_log - mean(activity_casp_log, na.rm = TRUE),
+    
+    # Create NEW sequential IDs for INLA
+    park_id = row_number()  # 1, 2, 3... 110
+  )
+
+# Step 3: Build neighbor structure for park subset
+nb_parks <- poly2nb(zip_parks, queen = TRUE)
+summary(nb_parks)
+
+# Step 4: Check for and fix islands
+islands_parks <- which(card(nb_parks) == 0)
+cat("Islands in park subset:", length(islands_parks), "\n")
+
+if(length(islands_parks) > 0) {
+  cat("Fixing", length(islands_parks), "islands...\n")
+  coords <- st_coordinates(st_centroid(zip_parks))
+  
+  for(i in islands_parks) {
+    dists <- spDists(coords[i, , drop = FALSE], coords[-i, ])
+    nearest <- which.min(dists)
+    nb_parks[[i]] <- nearest
+    nb_parks[[nearest]] <- sort(c(nb_parks[[nearest]], i))
+  }
+  
+  # Verify fixed
+  if(any(card(nb_parks) == 0)) {
+    stop("Still have islands after fixing!")
+  }
+  cat("All islands connected\n")
+}
+
+# Step 5: Convert to INLA graph
+nb2INLA("zip_parks_adj.graph", nb_parks)
+g_parks <- inla.read.graph("zip_parks_adj.graph")
+
+cat("Park spatial graph created: n =", g_parks$n, "\n")
+
+################################################################################
+# PREPARE DATA FOR MODELS
+################################################################################
+
+# MODEL 1: All zip codes (n=1721)
+# Use original spatial structure
+data_model1.1 <- data.frame(
+  Y = zip_master$ldi_cat,
+  offset = zip_master$total_pop_log,
+  area_id = zip_master$zip_id,  # Sequential 1:1721
+  tick_suit = zip_master$tick_inf_zip,
+  activity = zip_master$activity_zip
+)
+
+# MODEL 2: Park zip codes only, zip-level tick × park activity (n=110)
+data_model2.1 <- zip_parks %>%
+  st_drop_geometry() %>%
+  transmute(
+    Y = ldi_cat,
+    offset = total_pop_log,
+    area_id = park_id,  # Sequential 1:110
+    tick_suit = tick_inf_zip,  # Zip-level tick (recalculated for subset)
+    activity = activity_casp   # Park activity (recalculated for subset)
+  )
+
+# MODEL 3: Park zip codes only, park tick × park activity (n=110)
+data_model3.1 <- zip_parks %>%
+  st_drop_geometry() %>%
+  transmute(
+    Y = ldi_cat,
+    offset = total_pop_log,
+    area_id = park_id,  # Sequential 1:110
+    tick_suit = tick_inf_casp,  # Park tick (recalculated for subset)
+    activity = activity_casp    # Park activity (recalculated for subset)
+  )
+
+# Verify data quality
+cat("\n=== DATA CHECKS ===\n")
+cat("Model 1: n =", nrow(data_model1), "| NAs =", sum(is.na(data_model1.1)), "\n")
+cat("Model 2: n =", nrow(data_model2), "| NAs =", sum(is.na(data_model2.1)), "\n")
+cat("Model 3: n =", nrow(data_model3), "| NAs =", sum(is.na(data_model3.1)), "\n")
+
+################################################################################
+# FIT MODELS
+################################################################################
+
+# Shared formula
+formula_bym2 <- Y ~ 1 + tick_suit * activity +
+  f(area_id, model = "bym2", graph = g, scale.model = TRUE,
+    hyper = list(
+      prec = list(prior = "pc.prec", param = c(1, 0.01)),
+      phi = list(prior = "pc", param = c(0.5, 0.5))
+    ))
+
+# Model 1: All zip codes
+cat("\nFitting Model 1 (All zip codes, n=1721)...\n")
+model1.1 <- inla(formula_bym2,
+               family = "nbinomial",
+               data = data_model1.1,
+               offset = offset,
+               control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+               control.inla = list(strategy = "simplified.laplace"))
+
+# Model 2: Park subset, zip tick × park activity
+cat("Fitting Model 2 (Park zip codes, n=110, zip tick × park activity)...\n")
+
+# Need to update formula to use park graph
+formula_bym2_parks <- Y ~ 1 + tick_suit * activity +
+  f(area_id, model = "bym2", graph = g_parks, scale.model = TRUE,
+    hyper = list(
+      prec = list(prior = "pc.prec", param = c(1, 0.01)),
+      phi = list(prior = "pc", param = c(0.5, 0.5))
+    ))
+
+model2.1 <- inla(formula_bym2_parks,
+               family = "nbinomial",
+               data = data_model2.1,
+               offset = offset,
+               control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+               control.inla = list(strategy = "simplified.laplace"))
+
+# Model 3: Park subset, park tick × park activity
+cat("Fitting Model 3 (Park zip codes, n=110, park tick × park activity)...\n")
+model3.1 <- inla(formula_bym2_parks,  # Same graph as Model 2
+               family = "nbinomial",
+               data = data_model3.1,
+               offset = offset,
+               control.predictor = list(compute = TRUE),
+               control.compute = list(dic = TRUE, waic = TRUE, cpo = TRUE),
+               control.inla = list(strategy = "simplified.laplace"))
+
+################################################################################
+# COMPARE RESULTS
+################################################################################
+
+cat("\n=== RESULTS ===\n")
+
+# Model 1
+cat("\nModel 1 (All zip codes):\n")
+print(model1.1$summary.fixed)
+cat("Phi:", model1.1$summary.hyperpar["Phi for area_id", "mean"], "\n")
+cat("WAIC:", model1.1$waic$waic, "\n")
+
+# Model 2
+cat("\nModel 2 (Park zips, zip tick × park activity):\n")
+print(model2.1$summary.fixed)
+cat("Phi:", model2.1$summary.hyperpar["Phi for area_id", "mean"], "\n")
+cat("WAIC:", model2.1$waic$waic, "\n")
+
+# Model 3
+cat("\nModel 3 (Park zips, park tick × park activity):\n")
+print(model3.1$summary.fixed)
+cat("Phi:", model3.1$summary.hyperpar["Phi for area_id", "mean"], "\n")
+cat("WAIC:", model3.1$waic$waic, "\n")
+
+
+```
+```{r}
+
+# Create coefficient plot for all models
+plot_coefficients <- function(model_list, model_names) {
+  
+  coef_data <- lapply(seq_along(model_list), function(i) {
+    fixed <- model_list[[i]]$summary.fixed[-1, ]  # Remove intercept
+    data.frame(
+      model = model_names[i],
+      term = rownames(fixed),
+      beta = fixed$mean,
+      lower = fixed$`0.025quant`,
+      upper = fixed$`0.975quant`
+    )
+  }) %>% bind_rows()
+  
+  # Clean up term names
+  coef_data$term <- factor(coef_data$term,
+                           levels = c("tick_suit:activity", "activity", "tick_suit"),
+                           labels = c("Tick × Activity", "Human Activity", "Tick Suitability"))
+  
+  ggplot(coef_data, aes(x = beta, y = term, color = model)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray50") +
+    geom_errorbarh(aes(xmin = lower, xmax = upper), 
+                   position = position_dodge(width = 0.5),
+                   height = 0.2, linewidth = 1) +
+    geom_point(position = position_dodge(width = 0.5), size = 3) +
+    scale_color_manual(values = c("#E69F00", "#56B4E9", "#009E73")) +
+    labs(x = "Log Relative Risk (95% CI)", 
+         y = NULL,
+         title = "Fixed Effect Estimates Across Models",
+         color = "Model") +
+    theme_minimal(base_size = 12) +
+    theme(panel.grid.major.y = element_blank(),
+          legend.position = "bottom")
+}
+
+coef_plot <- plot_coefficients(list(model1.1, model2.1, model3.1),
+  c("Model 1: Zip × Zip", "Model 2: Zip × Park", "Model 3: Park × Park"))
+
+print(coef_plot)
+
+model3.1$summary.fixed
+```
+
+```{r}
+fixed_df <- as.data.frame(model3.1$summary.fixed) #model3
+fixed_df$covariate <- rownames(fixed_df)
+
+fixed_df %>% 
+  filter(covariate != "(Intercept)" &
+           covariate != "tick_suit") %>% 
+ggplot(aes(x=covariate, y= mean)) +
+  geom_point() +
+  geom_errorbar(aes(ymin=`0.025quant`, ymax=`0.975quant`), width=0.2) +
+  coord_flip() +
+  geom_hline(yintercept = 0) +
+  theme_minimal() +
+  labs(title="Posterior estimates of fixed effects", y="Posterior mean", x="") 
+
+
+model3$summary.hyperpar 
+# phi = .94 highly spatially strucutred, .6 is random noise
+
+model3$summary.fixed
+exp(-11.1) #1.511232e-05 baseline log risk when all covariates are 0, baseline risk is very low
+exp(.0701) #1.072615 for each 1-unit increase in tick suitability, log-risk increase by .07, relative risk = 1.07 significant
+exp(-1.821954e-07)# relative risk = 0.9999998
+exp(4.351756e-08) # relative risk = 1
+```
+
+
+```{r}
+d <- as.data.frame(model3$summary.fixed)
+d$variable <- rownames(d)
+rownames(d) <- NULL
+
+d <- d %>% 
+  #filter(variable != "(Intercept)" & variable != "tick_suit") %>% 
+  rename(lower = "0.025quant",
+         upper = "0.975quant") 
+
+d %>% 
+  
+ggplot() +
+  geom_pointrange(aes(x= variable, y=mean, ymin=lower, ymax=upper),
+                  position=position_dodge(0.5)) +
+  labs(y=expression("exp(" ~beta[st]~ ")"),
+       x="",
+       col="") +
+  geom_hline(yintercept=1, alpha=0.5) +
+  ggthemes::scale_color_tableau("Color Blind") +
+  #coord_flip() #+
+  #theme_publish() +
+  scale_y_log10()
+
+
+# create the grid
+grid <- expand.grid(
+  tick_suit = c(0, 1),
+  activity = seq(min(zip_parks$activity_casp), max(zip_parks$activity_casp), length.out = 100)
+)
+d
+grid$area <- NA
+# 'model3' is your BYM2 model
+# Get the fixed effects posterior means
+fe <- model3$summary.fixed
+
+grid$lp <- fe["(Intercept)", "mean"] +
+           fe["tick_suit", "mean"] * grid$tick_suit +
+           fe["activity", "mean"] * grid$activity +
+           fe["tick_suit:activity", "mean"] * grid$tick_suit * grid$activity
+
+
+grid$pred <- exp(exp(grid$lp))
+
+
+ggplot(grid, aes(x = activity, y = pred, color = tick_suit)) +
+  geom_line(size = 1.2) +
+  scale_color_gradient(low = "blue", high = "red") +
+  labs(x = "Activity", y = "Predicted Outcome", color = "Tick Suit") +
+  theme_minimal()
+
+summary(grid$pred)
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# 1. Center activity to improve numerical stability
+grid <- expand.grid(
+  tick_suit = seq(0, 1, length.out = 50),                       # continuous gradient
+  activity = seq(min(zip_parks$activity_casp), max(zip_parks$activity_casp), length.out = 100)
+)
+grid$activity_c <- grid$activity - mean(zip_parks$activity_casp)
+
+# 2. Extract fixed effects from model
+fe <- model3$summary.fixed
+
+# 3. Compute linear predictor (posterior mean)
+grid$lp_mean <- fe["(Intercept)", "mean"] +
+                fe["tick_suit", "mean"] * grid$tick_suit +
+                fe["activity", "mean"] * grid$activity +
+                fe["tick_suit:activity", "mean"] * grid$tick_suit * grid$activity
+
+# 4. Compute credible intervals for linear predictor
+# Using 2.5% and 97.5% quantiles from fixed effects (ignoring random effects)
+grid$lp_lower <- fe["(Intercept)", "0.025quant"] +
+                 fe["tick_suit", "0.025quant"] * grid$tick_suit +
+                 fe["activity", "0.025quant"] * grid$activity +
+                 fe["tick_suit:activity", "0.025quant"] * grid$tick_suit * grid$activity
+
+grid$lp_upper <- fe["(Intercept)", "0.975quant"] +
+                 fe["tick_suit", "0.975quant"] * grid$tick_suit +
+                 fe["activity", "0.975quant"] * grid$activity +
+                 fe["tick_suit:activity", "0.975quant"] * grid$tick_suit * grid$activity
+
+# 5. Transform from log-scale to predicted counts (Negative Binomial)
+grid$pred <- exp(grid$lp_mean)
+grid$pred_lower <- exp(grid$lp_lower)
+grid$pred_upper <- exp(grid$lp_upper)
+
+# 6. Plot
+ggplot(grid, aes(x = activity, y = pred, color = tick_suit)) +
+  geom_ribbon(aes(ymin = pred_lower, ymax = pred_upper, fill = tick_suit),
+              alpha = 0.2, color = NA) +
+  geom_line(size = 1.2) +
+  scale_color_gradient(low = "blue", high = "red") +
+  scale_fill_gradient(low = "blue", high = "red") +
+  labs(x = "Activity (centered)", y = "Predicted Counts", color = "Tick Suit", fill = "Tick Suit") +
+  theme_minimal() +
+  ylim(c(0,1)) #+ xlim(c(0,100))
+
+
+
+
+
+```
+

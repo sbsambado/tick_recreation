@@ -1,0 +1,194 @@
+---
+title: "Analyses"
+output: html_document
+date: "2025-09-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(purrr)
+library(sf)
+
+## important datasets
+# annual
+casp_fulldata_annual <- st_read("data/processed/casp_fulldata_annual.gpkg") %>% 
+  mutate(hotspot_index = tick_year_inf*casp_year_meantotal)
+
+# monthly
+casp_fulldata_monthly_nometa <- st_read("data/processed/casp_fulldata_monthly_nometa.gpkg")
+
+```
+
+raw datasets
+```{r}
+##Flickr
+flickr_notdistinct_20212024 <- read.csv("data/processed/flickr_21to24_notdistinct.csv")
+flickr_distinct_20212024_v2 <- read.csv("data/processed/flickr_21to24_distinct_v2.csv")
+
+##GBIF
+# 1150401
+gbif_distinct_20212023 <- read.csv("data/processed/gbif_distinct_20212023.csv")
+```
+
+tick summaries
+```{r}
+
+## infected = where is infection risk
+casp_fulldata_annual %>% 
+  st_drop_geometry() %>% 
+  group_by(district) %>% 
+  summarise(mean = round(mean(tick_year_inf, na.rm = TRUE),2),
+            sd = round(sd(tick_year_inf, na.rm = TRUE),2))
+
+
+casp_fulldata_annual %>% 
+  st_drop_geometry() %>% 
+  group_by(UNITNAME) %>% 
+  summarise(mean = mean(tick_year_inf, na.rm = TRUE)) %>% 
+  arrange(desc(mean)) #%>% filter(mean == 0.0)
+
+## presence = when ticks are most active
+casp_fulldata_monthly_nometa %>% 
+  st_drop_geometry() %>% 
+  group_by(UNITNAME, month) %>% 
+  summarise(max = max(tick_monthly_presence)) %>% 
+  arrange(desc(max))
+
+
+casp_fulldata_monthly_nometa %>% 
+  st_drop_geometry() %>% 
+  group_by(month) %>% 
+  summarise(max = mean(tick_monthly_presence, na.rm = TRUE),
+            sd = sd(tick_monthly_presence, na.rm = TRUE)) %>% 
+  arrange(desc(max))
+```
+
+social media summaries
+```{r}
+
+flickr_distinct_20212024_v2 %>% 
+  group_by(month) %>% 
+  summarise(mean = max(flickr_monthly_uniquetotals, na.rm = TRUE)) %>% 
+  arrange(desc(mean))
+  
+flickr_distinct_20212024_v2 %>% 
+  group_by(UNITNAME) %>% 
+  summarise(mean = max(flickr_monthly_uniquetotals, na.rm = TRUE)) %>% 
+  arrange(desc(mean))
+
+
+gbif_distinct_20212023 %>% 
+  group_by(month) %>% 
+  summarise(mean = max(gbif_monthly_uniquetotals, na.rm = TRUE)) %>% 
+  arrange(desc(mean))
+
+gbif_distinct_20212023 %>% 
+  group_by(UNITNAME) %>% 
+  summarise(mean = max(gbif_monthly_uniquetotals, na.rm = TRUE)) %>% 
+  arrange(desc(mean))
+```
+
+validation of social media
+```{r}
+casp_fulldata_monthly_nometa
+
+
+cor.test(casp_fulldata_monthly_nometa$casp_year_meantotal, casp_fulldata_monthly_nometa$gbif_monthly_avgtotal, method = "spearman" )
+# S = 1584891323, p-value < 2.2e-16, rho = 0.3795654 
+
+
+cor.test(casp_fulldata_monthly_nometa$casp_year_meantotal, casp_fulldata_monthly_nometa$flickr_monthly_avgtotal, method = "spearman" )
+# S = 1789924940, p-value < 2.2e-16, 0.2993012 
+
+cor.test(casp_fulldata_monthly_nometa$flickr_monthly_avgtotal, casp_fulldata_monthly_nometa$gbif_monthly_avgtotal, method = "spearman" )
+# S = 2480431383, p-value < 2.2e-16, rho = 0.2020825 
+```
+
+boostrap social media data monthly visitation
+```{r}
+
+set.seed(42)
+social_data <- data.frame(
+  UNITNAME = sample(paste0("Park", 1:10), 1000, replace = TRUE),
+  month = sample(1:12, 1000, replace = TRUE))
+
+observed_dist <- casp_fulldata_monthly_nometa %>% st_drop_geometry() %>% 
+  group_by(UNITNAME, month) %>% 
+  summarise(observed_count = n(), .groups = "drop")
+
+n_iterations <- 1000
+
+# Bootstrap function: Randomly permutes months within each park
+bootstrap_fun <- function(data) {
+  data %>%
+    group_by(UNITNAME) %>%
+    mutate(month = sample(1:12, size = n(), replace = TRUE)) %>% 
+   
+    group_by(UNITNAME, month) %>%
+    summarise(boot_count = n(), .groups = "drop")
+}
+
+# Run bootstrap
+bootstrap_results <- map_dfr(1:n_iterations, function(i) {
+  boot_i <- bootstrap_fun((casp_fulldata_monthly_nometa %>% st_drop_geometry()))
+  boot_i$iteration <- i
+  boot_i
+})
+
+
+null_summary <- bootstrap_results %>%
+  group_by(UNITNAME, month) %>%
+  summarise(
+    mean_null = mean(boot_count),
+    lower_95 = quantile(boot_count, 0.025),
+    upper_95 = quantile(boot_count, 0.975),
+    .groups = "drop"
+  )
+
+
+compare_df <- observed_dist %>%
+  left_join(null_summary, by = c("UNITNAME", "month")) %>%
+  mutate(
+    significant = observed_count > upper_95 | observed_count < lower_95)
+
+
+compare_df %>%
+  filter(UNITNAME == "Admiral William Standley SRA") %>%
+  ggplot(aes(x = factor(month), y = observed_count)) +
+  geom_col(fill = "steelblue", alpha = 0.8) +
+  geom_errorbar(aes(ymin = lower_95, ymax = upper_95), width = 0.3, color = "darkred") +
+  labs(
+    title = paste("Observed vs Null Monthly Visitation"),
+    x = "Month", y = "Record Count"
+  ) +
+  theme_minimal() #Bars outside the red error bars indicate that monthly visitation patterns are more structured than expected by chance.
+
+## add significance
+significance_summary <- compare_df %>%
+  group_by(UNITNAME) %>%
+  summarise(
+    total_months = n(),  # usually 12 months
+    significant_months = sum(significant, na.rm = TRUE),
+    proportion_significant = significant_months / total_months,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(proportion_significant))
+
+significance_summary %>% 
+  #head(20) %>% 
+ggplot( aes(x = reorder(UNITNAME, -significant_months), y = significant_months)) +
+  geom_col(fill = "forestgreen") +
+  labs(
+    title = "Number of Months with Significant Seasonality per Park",
+    x = "Park",
+    y = "# of Significant Months"
+  ) +
+  theme_minimal() +
+  coord_flip()
+
+
+significance_summary <- significance_summary %>%
+  mutate(seasonality = ifelse(significant_months >= 6, "Strong", "Weak"))
+```

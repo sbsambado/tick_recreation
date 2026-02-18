@@ -1,0 +1,545 @@
+---
+title: "Figure4_20260110"
+output: html_document
+date: "2026-01-10"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(wesanderson)
+library(ggspatial)
+library(cowplot)
+library(tigris)
+
+
+pal <- wes_palette("Zissou1", 4, type = "continuous")
+
+
+district_boundary <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp")
+casp_fulldata_monthly <- st_read("data/processed/casp_fulldata_monthly_nometa.gpkg")
+
+
+
+```
+
+
+A. Upload boundaries
+```{r}
+# california shp
+ca_shp <- counties(state = "CA", cb = TRUE, class = "sf")
+
+# california state parks shp (casp)
+casp_shp <- st_read("data/raw/parks/casp_individualpark_boundaries/ParkBoundaries.shp")
+
+# california district & division shp
+casp_districtdivision_shp <- st_read("data/raw/parks/casp_district_boundaries/Districts.shp")
+
+
+# make sure northern field division is the same
+casp_districtdivision_shp <- casp_districtdivision_shp %>% 
+  mutate(field_divi = case_when(field_divi == "Northern Field Division" ~ "Northern Field Division",
+                                field_divi == "Nothern Field Division" ~ "Northern Field Division",
+                                TRUE ~ field_divi))
+
+```
+
+B. Select certain parks
+```{r}
+### Select for parks that are more likely to have recreation
+casp_shp_select <- casp_shp %>% # 462 original parks
+  filter(grepl(" SP", UNITNAME) |
+           grepl(" SRA", UNITNAME) |
+           grepl(" SB", UNITNAME) |
+           grepl(" SNR", UNITNAME) |
+           grepl(" SW", UNITNAME)) # 254 select parks
+
+### Add metadata to which districts and divisions the select parks belong to
+
+# correct crs
+casp_shp_select_crs <- st_transform(casp_shp_select, st_crs(casp_districtdivision_shp))  
+
+# if parks overlap multiple districts, st_intersects is better than st_within
+casp_shp_select_crs <- st_join(casp_shp_select_crs, casp_districtdivision_shp, join = st_intersects) 
+
+# checked which parks were na filter(is.na(field_divi)) 
+casp_shp_select_crs <- casp_shp_select_crs %>% 
+  mutate(field_divi = case_when(UNITNAME == "Cardiff SB" ~ "Coastal Field Division",
+                                UNITNAME == "Manchester SP" ~ "Nothern Field Division",
+                                UNITNAME == "Silver Strand SB" ~ "Coastal Field Division",
+                                TRUE ~ field_divi),
+         district = case_when(UNITNAME == "Cardiff SB" ~ "San Diego Coast District",
+                              UNITNAME == "Manchester SP" ~ "Sonoma-Mendocino Coast District",
+                              UNITNAME == "Silver Strand SB" ~ "San Diego Coast District",
+                              TRUE ~ district)) 
+
+
+casp_shp_clean <- casp_shp_select_crs %>% 
+  dplyr::select(UNITNAME, Shape_Area, field_divi, district, geometry) 
+```
+
+
+```{r}
+normalized <- casp_fulldata_monthly %>%
+  st_make_valid() %>%
+  group_by(district) %>%
+  mutate(
+    tick_norm = tick_monthly_presence,  # already 0–1
+    human_norm = (flickrgbif_estimatedvisits - min(flickrgbif_estimatedvisits, na.rm = TRUE)) /
+                 (max(flickrgbif_estimatedvisits, na.rm = TRUE) - min(flickrgbif_estimatedvisits, na.rm = TRUE)),
+    overlap_index = tick_norm * human_norm) %>%
+  ungroup() %>%
+  filter(!is.na(overlap_index))
+
+
+```
+
+```{r}
+make_overlap_plot <- function(data,
+                              district_name,
+                              tick_min = 0.1,
+                              target_prop = 0.25,
+                              rect_ymax = 1,
+                              label_y = 0.5,
+                              show_title = TRUE) {
+
+  monthly_overlap <- data %>%
+    filter(district == district_name) %>%
+    group_by(month) %>%
+    summarise(
+      tick_mean   = mean(tick_norm, na.rm = TRUE),
+      human_mean  = mean(human_norm, na.rm = TRUE),
+      overlap_mean = mean(overlap_index, na.rm = TRUE),
+      .groups = "drop") %>%
+    arrange(month) %>%
+    mutate(overlap_filtered = ifelse(tick_mean >= tick_min, overlap_mean, 0)) %>%
+    arrange(desc(overlap_filtered)) %>%
+    mutate(overlap_prop = overlap_filtered / sum(overlap_filtered, na.rm = TRUE),
+      cum_overlap  = cumsum(overlap_prop),
+      high_risk    = cum_overlap <= target_prop) %>%
+    arrange(month)
+
+  p <- ggplot(monthly_overlap, aes(x = as.integer(month))) +
+    geom_rect(
+      data = subset(monthly_overlap, high_risk),
+      aes(xmin = month - 0.5,
+        xmax = month + 0.5,
+        ymin = 0,
+        ymax = rect_ymax),
+      fill = "purple",
+      alpha = 0.15,
+      inherit.aes = FALSE) +
+    geom_smooth(aes(y = tick_mean), color = "tomato", se = FALSE, size = 2) +
+    geom_smooth(aes(y = human_mean), color = "darkgreen", se = FALSE, size = 2) +
+    scale_x_continuous(breaks = 1:12, minor_breaks = NULL) +
+    labs(
+      x = "Month",
+      y = "Normalized intensity",
+      #title = if (show_title) "High-risk months based on cumulative tick–human overlap" else NULL,
+      subtitle = if (show_title) district_name else NULL, 
+        #paste0("Shaded months account for ",target_prop * 100,"% of annual overlap (tick suitability ≥ ", tick_min,")")else NULL
+      ) +
+    theme_classic(base_size = 14) +
+    theme(axis.title = element_text(face = "bold")) 
+    #+ annotate( "text",x = 7.5,y = label_y,label = district_name,hjust = 0,size = 5)
+
+  return(p)
+}
+
+
+
+```
+
+```{r}
+plot1 <- make_overlap_plot(
+  normalized,
+  district_name = "Bay Area District",
+   show_title = TRUE,
+  #tick_min = 0.1,
+  #target_prop = 0.5,
+  rect_ymax = 1,
+  label_y = 0.5) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+plot2 <- make_overlap_plot(
+  normalized,
+  district_name = "Sierra District",
+  rect_ymax = 0.2,
+  label_y = 0.2,
+  show_title = TRUE
+)+ theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+plot3 <- make_overlap_plot(
+  normalized,
+  district_name = "Orange Coast District",
+  rect_ymax = 0.75,
+  show_title = TRUE)+ theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8)) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+plot4 <- make_overlap_plot(
+  normalized,
+  district_name = "Ocotillo Wells District",
+  show_title = TRUE
+) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+
+plot5 <- make_overlap_plot(
+  normalized,
+  district_name = "North Coast Redwoods District",
+  rect_ymax = 0.5,
+  show_title = TRUE
+) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+plot6 <- make_overlap_plot(
+  normalized,
+  district_name = "Gold Fields District",
+   rect_ymax = 0.78,
+  show_title = TRUE
+) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+plot7 <- make_overlap_plot(
+  normalized,
+  district_name = "Colorado Desert District",
+   rect_ymax = 0.4,
+  show_title = TRUE
+) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+plot8 <- make_overlap_plot(
+  normalized,
+  district_name = "Northern Buttes District",
+  show_title = TRUE
+) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+plot9 <- make_overlap_plot(
+  normalized,
+  district_name = "Monterey District",
+  rect_ymax = 0.78,
+  show_title = TRUE
+) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+
+plot10 <- make_overlap_plot(
+  normalized,
+  district_name = "Inland Empire District",
+  show_title = TRUE
+) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+plot11 <- make_overlap_plot(
+  normalized,
+  district_name = "Channel Coast District",
+  rect_ymax = 0.78,
+  show_title = TRUE
+) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+plot12 <- make_overlap_plot(
+  normalized,
+  district_name = "Great Basin District",
+  #rect_ymax = 0.78,
+  show_title = TRUE
+) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+plot13 <- make_overlap_plot(
+  normalized,
+  district_name = "Santa Cruz District",
+  rect_ymax = 0.8,
+  show_title = TRUE
+) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+plot14 <- make_overlap_plot(
+  normalized,
+  district_name = "Oceano Dunes District",
+  rect_ymax = 0.78,
+  show_title = TRUE
+) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+plot15 <- make_overlap_plot(
+  normalized,
+  district_name = "San Diego Coast District",
+  rect_ymax = 0.75,
+  show_title = TRUE
+) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+plot16 <- make_overlap_plot(
+  normalized,
+  district_name = "Diablo Range District",
+  rect_ymax = 0.74,
+  show_title = TRUE
+) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+
+plot17 <- make_overlap_plot(
+  normalized,
+  district_name = "Sonoma-Mendocino Coast District",
+  rect_ymax = 0.75,
+  show_title = TRUE
+) + theme(panel.border = element_rect(
+      colour = "black",
+      fill = NA,
+      linewidth = 0.8))
+ggarrange(plot1, plot2, plot3, plot4, ncol = 1)
+
+```
+
+
+save
+```{r}
+ggsave(
+  "InlandEmpire_overlap.png",
+  plot = plot10,
+  width = 5,
+  height = 3.2,
+  dpi = 300)
+
+
+```
+
+
+make inset of california
+
+```{r}
+district_focus <- casp_districtdivision_shp %>% 
+  filter(district %in% c("North Coast Redwoods District", #"Northern Buttes District", 
+                         "Monterey District", "Ocotillo Wells District",
+                         "Channel Coast District", "Colorado Desert District", #"Great Basin District",
+                         "Sierra District", "Gold Fields District", "Bay Area District"))
+
+park_focus <- casp_shp_clean %>% 
+  filter(district %in% c("North Coast Redwoods District", #"Northern Buttes District", 
+                         "Monterey District", "Ocotillo Wells District",
+                         "Channel Coast District", "Colorado Desert District", #"Great Basin District",
+                         "Sierra District", "Gold Fields District", "Bay Area District"))
+
+
+ca_focus_map <- ggplot() +
+  geom_sf(data = casp_districtdivision_shp, fill = "grey95", color = "black", alpha = 0.8) +
+  geom_sf(data = district_focus, fill = "grey80", color = "black", linewidth = 0.4) +
+  geom_sf(data = park_focus, color = "tomato", size = 1, alpha = 0.7) +
+  theme_void() +
+  theme(legend.title = element_text(face = "bold"))  +
+  
+   annotation_north_arrow(location = "bl", which_north = "true",
+                         height = unit(1.2, "cm"),
+                         width = unit(1.2, "cm"),
+                         pad_x = unit(1.6, "cm")) + #, pad_y = unit(1, "cm") # 2.5 also worked
+  
+  annotation_scale(location = "bl", width_hint = 0.3, text_cex = 0.9,
+                   pad_x = unit(1.6, "cm"), pad_y = unit(2, "cm")) 
+
+ ggsave("CA_focus_map.png",
+  plot = ca_focus_map,
+  width = 6.5,
+  height = 8.5,
+  dpi = 300)
+
+## legend
+legend_df <- data.frame(
+  x = c(1, 1),
+  y = c(1, 2),
+  group = c("Tick activity", "Human activity"))
+
+legend_plot <- ggplot(legend_df, aes(x = x, y = y, color = group)) +
+  geom_line(aes(y = y), linewidth = 2) +
+  scale_color_manual(
+    values = c(
+      "Tick activity" = "red",
+      "Human activity" = "darkgreen"
+    )
+  ) +
+  theme_void() +
+  theme(
+    legend.position = "bottom",#"right",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 16),
+    legend.key.width = unit(1.2, "cm"))
+
+ggsave(
+  "tick_human_legend.png",
+  plot = legend_plot,
+  width = 4,#2.2,
+  height = 1.2,
+  dpi = 300,
+  bg = "transparent")
+
+
+## title 
+title_plot <- ggplot(legend_df, aes(x = x, y = y, color = group)) +
+  geom_line(aes(y = y), linewidth = 2)  +
+  theme_void() +
+  guides(color = FALSE)+
+  theme(
+    plot.text = element_text(size = 14),
+    plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+  plot.subtitle = element_text(hjust = 0.5, size = 13)) +
+  labs(title = "Seasonal Tick-Human overlap", #High-risk months based on cumulative tick–human overlap", 
+       subtitle = "Shaded months represent the highest cumulative overlap")
+       #account for 25% of annual overlap (tick ≥  0.1)")
+
+ggsave(
+  "tick_human_title.png",
+  plot = title_plot,
+  width = 6,#2.2,
+  height = 1.2,
+  dpi = 300,
+  bg = "transparent")
+```
+
+##another version
+
+```{r}
+library(ggpubr)
+ggarrange(plot5 + rremove("xlab") + rremove("ylab") + scale_x_continuous(expand = c(0,0)) + 
+            theme(axis.text.y = element_text(size = 15),axis.text.x = element_text(size = 12)), 
+          
+          plot1 + rremove("xlab") + rremove("ylab") + #scale_x_continuous(expand = c(0,0)) + 
+            theme(axis.text.y = element_text(size = 15),axis.text.x = element_text(size = 12)), 
+          
+          plot9 + rremove("xlab") + rremove("ylab") + #scale_x_continuous(expand = c(0,0)) + 
+            theme(axis.text.y = element_text(size = 15), axis.text.x = element_text(size = 12)), 
+          
+          plot11 + rremove("xlab") + rremove("ylab") + #scale_x_continuous(expand = c(0,0)) + 
+            theme(axis.text.y = element_text(size = 15), axis.text.x = element_text(size = 12)),
+          ncol = 1, align = "hv")
+
+
+plots <- list(plot5, plot1, plot9, plot11)
+plots <- list(plot2, plot6, plot7, plot4)
+
+plots <- lapply(plots, function(p) {
+  p +
+    rremove("xlab") + rremove("ylab") +
+    scale_x_continuous(breaks = 1:12, expand = c(0, 0)) +  # exact 1-12, no padding
+    theme(axis.text.y = element_text(size = 15),
+          title = element_text(face = "bold"),
+      axis.text.x = element_text(size = 12)) 
+})
+
+left <- ggarrange(plotlist = plots, ncol = 1, align = "hv")
+right <- ggarrange(plotlist = plots, ncol = 1, align = "hv")
+
+combo <- ggarrange(left, right)
+annotate_figure(combo, 
+                left = text_grob("Normalized Activity", face = "bold", size = 18, rot = 90),
+                bottom = text_grob("Month", face = "bold", size = 18))
+```
+do in order of months
+```{r}
+plots <- list(plot1, plot11, plot9, plot5)
+plots <- list(plot6, plot2, plot7, plot4)
+plots <- lapply(plots, function(p) {
+  p +
+    rremove("xlab") + rremove("ylab") +
+    scale_x_continuous(breaks = 1:12, expand = c(0, 0)) +  # exact 1-12, no padding
+    theme(axis.text.y = element_text(size = 15),
+          title = element_text(face = "bold"),
+      axis.text.x = element_text(size = 12)) 
+})
+
+left_plot2 <- ggarrange(plotlist = plots, ncol = 1, align = "hv")
+right_plot2 <- ggarrange(plotlist = plots, ncol = 1, align = "hv")
+
+combo2 <- ggarrange(left_plot2, right_plot2)
+annotate_figure(combo2, 
+                left = text_grob("Normalized Activity", face = "bold", size = 18, rot = 90),
+                bottom = text_grob("Month", face = "bold", size = 18))
+```
+
+try month by month
+```{r}
+## left side
+plots <- list(#plot1, plot11, 
+              #plot13, 
+              plot14, 
+              #plot9, 
+              plot3, plot16, plot17, plot5)
+plots <- lapply(plots, function(p) {
+  p +
+    rremove("xlab") + rremove("ylab") +
+    scale_x_continuous(breaks = 1:12, expand = c(0, 0)) +  # exact 1-12, no padding
+    theme(axis.text.y = element_text(size = 15),
+          title = element_text(face = "bold"),
+      axis.text.x = element_text(size = 12)) 
+})
+
+left_3 <- ggarrange(plotlist = plots, ncol = 1, align = "hv")
+
+
+## right side
+plots <- list(plot6, #plot8, 
+              plot15, plot2, 
+               
+              plot7,
+              plot4)
+plots <- lapply(plots, function(p) {
+  p +
+    rremove("xlab") + rremove("ylab") +
+    scale_x_continuous(breaks = 1:12, expand = c(0, 0)) +  # exact 1-12, no padding
+    theme(axis.text.y = element_text(size = 15),
+          title = element_text(face = "bold"),
+      axis.text.x = element_text(size = 12)) 
+})
+
+right_3 <- ggarrange(plotlist = plots, ncol = 1, align = "hv")
+
+combo3 <- ggarrange(left_3, right_3)
+combo3_an <- annotate_figure(combo3, 
+                left = text_grob("Normalized Activity", face = "bold", size = 18, rot = 90),
+                bottom = text_grob("Month", face = "bold", size = 18),
+                top = text_grob("Seasonal Tick-Human Overlap", face = "bold", size = 19),
+                fig.lab = NULL, fig.lab.face = NULL,fig.lab.size = 0)
+
+
+combo3_an_legend <- ggarrange(combo3_an,legend_plot, ncol = 1, heights = c(1, 0.03), align = "v")
+ggsave(combo3_an_legend, file = "figures/fig_4_seasonaloverlap.png", width = 10, height = 12, bg = "transparent")
+```

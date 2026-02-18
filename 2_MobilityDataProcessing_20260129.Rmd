@@ -1,0 +1,1048 @@
+---
+title: "2_MobilityDataProcessing_20260129"
+output: html_document
+date: "2026-01-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## upload necessary packages
+library(tidyverse)
+library(sf)
+library(rgbif)
+library(data.table)
+library(httr)
+library(jsonlite)
+library(lubridate)
+library(purrr)
+library(googledrive)
+library(terra)
+library(stringr)
+library(exactextractr)
+
+```
+
+
+#GBIF
+Download data for 
+- bbox around all of my parks (instead of individual polygons)
+- years 2021, 2022, 2023 (but do them individually to make easier to manipulate data)
+- only human observations, with coordinates, present only records, 
+
+a. Pull down data
+```{r}
+## API
+#Sys.setenv(GBIF_USER = "sbsambado")
+#Sys.setenv(GBIF_PWD = "2411ucsb")
+#Sys.setenv(GBIF_EMAIL = "sbsambado@ucsb.edu")
+
+
+## correct CRS
+casp_shp_gbif <- casp_shp_clean %>% 
+  st_transform(crs = 4326) %>% 
+  st_make_valid()
+
+# get bbox
+casp_shp_bbox <- st_bbox(casp_shp_gbif)
+
+# make valid WKT for gbif
+casp_shp_wkt <- sprintf("POLYGON((%f %f, %f %f, %f %f, %f %f, %f %f))",
+  casp_shp_bbox ["xmin"], casp_shp_bbox ["ymin"],
+  casp_shp_bbox ["xmax"], casp_shp_bbox ["ymin"],
+  casp_shp_bbox ["xmax"], casp_shp_bbox ["ymax"],
+  casp_shp_bbox ["xmin"], casp_shp_bbox ["ymax"],
+  casp_shp_bbox ["xmin"], casp_shp_bbox ["ymin"])
+
+
+### Pull down data
+
+## 2021 
+gbif_download_2021 <- occ_download(
+  pred_and(
+    pred("geometry", casp_shp_wkt),
+    pred("year", 2021),
+    pred("hasCoordinate", TRUE), 
+    pred("occurrenceStatus", "PRESENT"),
+    pred("basisOfRecord", "HUMAN_OBSERVATION")),
+  format = "SIMPLE_CSV")
+
+occ_download_wait('0007749-250827131500795') # check status 
+occ_download_get('0007749-250827131500795', overwrite = TRUE)
+# NEED TO FIX file path
+#unzip("/Users/sbsambado/scratch/0007749-250827131500795.zip", exdir = "gbif_2021_data")
+
+
+## 2022 
+gbif_download_2022 <- occ_download(
+  pred_and(
+    pred("geometry", casp_shp_wkt),
+    pred("year", 2022),
+    pred("hasCoordinate", TRUE), 
+    pred("occurrenceStatus", "PRESENT"),
+    pred("basisOfRecord", "HUMAN_OBSERVATION")),
+  format = "SIMPLE_CSV")
+
+occ_download_get('0008181-250827131500795', overwrite = TRUE)
+# NEED TO FIX file path
+#unzip("/Users/sbsambado/scratch/0008181-250827131500795.zip", exdir = "ticks_recreation/gbif_2022_data")
+
+## 2023
+ gbif_download_2023 <- occ_download(
+   pred_and(
+     pred("geometry", casp_shp_wkt),
+     pred("year", 2023),
+     pred("hasCoordinate", TRUE), 
+     pred("occurrenceStatus", "PRESENT"),
+     pred("basisOfRecord", "HUMAN_OBSERVATION")),
+   format = "SIMPLE_CSV")
+
+occ_download_get('0008188-250827131500795', overwrite = TRUE)
+# NEED TO FIX file path
+#unzip("/Users/sbsambado/scratch/0008188-250827131500795.zip", exdir = "gbif_2023_data")
+
+```
+
+b. Wrangle data
+```{r}
+## upload data
+gbif_data_2021 <- fread("data/raw/recreation/gbif/gbif_2021_data/0007749-250827131500795.csv", 
+                   select = c("scientificName", "decimalLatitude", "decimalLongitude", 
+                              "eventDate", "basisOfRecord", "recordedBy"))
+
+
+gbif_data_2022 <- fread("data/raw/recreation/gbif/gbif_2022_data/0008181-250827131500795.csv", 
+                   select = c("scientificName", "decimalLatitude", "decimalLongitude", 
+                              "eventDate", "basisOfRecord", "recordedBy"))
+
+gbif_data_2023 <- fread("data/raw/recreation/gbif/gbif_2023_data/0008188-250827131500795.csv", 
+                   select = c("scientificName", "decimalLatitude", "decimalLongitude", 
+                              "eventDate", "basisOfRecord", "recordedBy"))
+
+
+### extract observations per park per year
+## create a spatial buffer of parks
+casp_shp_gbif_buffer <- casp_shp_clean %>% 
+  st_make_valid() %>% 
+  st_transform(crs = 4326) %>% 
+  st_simplify(dTolerance = 0.001, preserveTopology = TRUE) %>% 
+  st_buffer(dist = 0.0005) # 50 meters 
+  
+
+## convert gbif points to sf 
+gbif_2021_sf <- st_as_sf(gbif_data_2021,
+                         coords = c("decimalLongitude", "decimalLatitude"),
+                         crs = 4326, remove = FALSE) %>%  # keep lat, lon columns
+  filter(!is.na(decimalLongitude) & !is.na(decimalLatitude))
+
+gbif_2022_sf <- st_as_sf(gbif_data_2022,
+                         coords = c("decimalLongitude","decimalLatitude"),
+                         crs = 4326, remove = FALSE) %>%  # keep lat, lon columns
+  filter(!is.na(decimalLongitude) & !is.na(decimalLatitude))
+
+gbif_2023_sf <- st_as_sf(gbif_data_2023,
+                         coords = c("decimalLongitude", "decimalLatitude"),
+                         crs = 4326, remove = FALSE) %>%  # keep lat, lon columns
+  filter(!is.na(decimalLongitude) & !is.na(decimalLatitude))
+
+## spatial join
+# this is slightly different from prior attempt when i used st_within
+casp_gbif_2021_sf <- st_join(gbif_2021_sf, casp_shp_gbif_buffer, join = st_intersects, left = FALSE ) 
+casp_gbif_2022_sf <- st_join(gbif_2022_sf, casp_shp_gbif_buffer, join = st_intersects, left = FALSE )
+casp_gbif_2023_sf <- st_join(gbif_2023_sf, casp_shp_gbif_buffer, join = st_intersects, left = FALSE )
+
+## save data
+# saveRDS(casp_gbif_2021_sf, file = "data/processed/gbif_casp_2021.RDS")
+# saveRDS(casp_gbif_2022_sf, file = "data/processed/gbif_casp_2022.RDS")
+# saveRDS(casp_gbif_2023_sf, file = "data/processed/gbif_casp_2023.RDS")
+
+```
+
+c. Format gbif data for final dataset
+```{r}
+## read in data
+casp_gbif_2021_sf <- readRDS("data/processed/gbif_casp_2021.RDS") 
+casp_gbif_2022_sf <- readRDS("data/processed/gbif_casp_2022.RDS")
+casp_gbif_2023_sf <- readRDS("data/processed/gbif_casp_2023.RDS")
+
+## do grepl now so it doesnt have to recalculate and only select observations with recorded observer
+casp_gbif_2021_sf2 <- casp_gbif_2021_sf %>% 
+    filter(grepl(" SP", UNITNAME) |
+           grepl(" SRA", UNITNAME) |
+           grepl(" SB", UNITNAME) |
+           grepl(" SNR", UNITNAME) |
+           grepl(" SW", UNITNAME)) %>% 
+  filter(grepl("obsr", recordedBy)) %>% # # 818832
+  mutate(date = ymd(eventDate),
+         month = substr(eventDate,6,7),
+         year = substr(eventDate,1,4)) 
+
+
+casp_gbif_2022_sf2 <- casp_gbif_2022_sf %>% 
+    filter(grepl(" SP", UNITNAME) |
+           grepl(" SRA", UNITNAME) |
+           grepl(" SB", UNITNAME) |
+           grepl(" SNR", UNITNAME) |
+           grepl(" SW", UNITNAME)) %>% 
+  filter(grepl("obsr", recordedBy)) %>% 
+  mutate(date = ymd(eventDate),
+         month = substr(eventDate,6,7),
+         year = substr(eventDate,1,4)) 
+
+
+casp_gbif_2023_sf2 <- casp_gbif_2023_sf %>% 
+    filter(grepl(" SP", UNITNAME) |
+           grepl(" SRA", UNITNAME) |
+           grepl(" SB", UNITNAME) |
+           grepl(" SNR", UNITNAME) |
+           grepl(" SW", UNITNAME)) %>% 
+  filter(grepl("obsr", recordedBy)) %>% 
+  mutate(date = ymd(eventDate),
+         month = substr(eventDate,6,7),
+         year = substr(eventDate,1,4))
+
+
+### tally in a more large data friendly way using data.table rather than dplyr
+# make function
+cacl_monthly_avg <- function(dt) {
+  dt <- as.data.table(dt) 
+  
+  dt[, date := as.IDate(date)]
+  dt[, `:=`(year = year(date), month = month(date))]
+  
+  # deduplicate: one user per day per park
+  dt_unique <- unique(dt[, .(UNITNAME, date, recordedBy, year, month)])
+  # Count users per day
+  daily <- dt_unique[, .N, by = .(UNITNAME, year, month, date)] 
+  # Aggregate monthly
+  monthly <- daily[, .(monthly_usertotal = sum(N)), by = .(UNITNAME, year, month)]
+  # Mean per month across years
+  monthly_avg <- monthly[, .(mean_monthly_usertotal = mean(monthly_usertotal)), by = .(UNITNAME, month)]
+  
+  ## now expand grid so all months (1-12) are represented
+  monthly_avg <- monthly_avg %>% 
+    complete(UNITNAME, month = 1:12, fill = list(mean_monthly_usertotal = 0)) %>% 
+    arrange(UNITNAME, month)
+  
+  return(monthly_avg)
+}
+
+# combine datasets
+gbif_dataset <- list(gbif_2021 = casp_gbif_2021_sf2,
+                     gbif_2022 = casp_gbif_2022_sf2,
+                     gbif_2023 = casp_gbif_2023_sf2)
+
+# make empty list to store results
+monthly_avg_results <- list()
+
+# run function
+for(name in names(gbif_dataset)) {
+  # calculate average users
+  monthly_avg_results[[name]] <- cacl_monthly_avg(gbif_dataset[[name]])}
+
+
+monthly_avg_all <- rbindlist(monthly_avg_results, idcol = "year_group")
+
+## calculate total unique 
+sum(monthly_avg_all$mean_monthly_usertotal)
+
+## now take year average
+gbif_distinct_20212023_df <- monthly_avg_all %>% 
+  group_by(UNITNAME, month) %>% 
+  summarise(mean_monthly_usertotal = mean(mean_monthly_usertotal), .groups = "drop") %>% # 2580 - so i'm short some parks
+  rename(gbif_monthly_uniquetotals = mean_monthly_usertotal)
+
+#write.csv(gbif_distinct_20212023_df, file = "data/processed/gbif_distinct_20212023.csv")
+
+```
+
+#Flickr
+
+a. Pull down data
+```{r}
+
+plan(multisession)
+
+api_key <- "4288cfbc0c862c18491a006f294fb2c3"
+url <- "https://api.flickr.com/services/rest/"
+min_date <- "2021-01-01"
+max_date <- "2023-12-31"
+search_text <- "street"
+
+# right projec
+casp_trans <- st_transform(casp_shp, 4326)
+
+# vectorized bbox for extraction
+bbox_list <- lapply(st_geometry(casp_trans), st_bbox)
+bbox_df <- do.call(rbind, lapply(bbox_list, function(x) as.data.frame(as.list(x))))
+
+# combine with original data
+bbox_casp_df <- casp_trans %>% 
+  st_drop_geometry() %>% 
+  bind_cols(bbox_df) %>% 
+  rename("park_name" = "UNITNAME")
+
+# add .5 degree buffer to bounding boxes
+
+parks_df <- bbox_casp_df %>%  
+  mutate(xmin_buffered = xmin - 0.5,
+         ymin_buffered = ymin - 0.5,
+         xmax_buffered = xmax + 0.5,
+         ymax_buffered = ymax + 0.5,
+         bbox = paste(xmin_buffered, ymin_buffered, xmax_buffered, ymax_buffered, sep = ","))
+
+
+## parallel function
+fetch_photos_for_park <- function(park_row) {
+  park_name <- park_row$park_name
+  bbox <- park_row$bbox
+  
+  message("processing park: ", park_name)
+  
+  
+  # Initial API call to get total pages
+  initial_response <- GET(url, query = list(
+    method = "flickr.photos.search",
+    api_key = api_key,
+    format = "json",
+    nojsoncallback = 1,
+    bbox = bbox,
+    text = search_text,
+    page = 1,
+    per_page = 500,
+    min_taken_date = min_date,
+    max_taken_date = max_date,
+    sort = "date-taken-desc",
+    extras = "geo,date_taken,tags"))
+  
+  
+  if (http_error(initial_response)) return(NULL)
+  
+  initial_data <- fromJSON(content(initial_response, as = "text"))
+  photos <- initial_data$photos
+  total_pages <- min(photos$pages, 5)
+  total <- as.integer(photos$total)
+  
+  
+  # Skip looping if only 1 page or few results
+  pages_to_fetch <- if (total <= 500) 1 else total_pages
+  
+  park_photos <- list()
+  for (p in seq_len(pages_to_fetch)) {
+    message("  Page ", p)
+    
+    resp <- GET(url, query = list(
+      method = "flickr.photos.search",
+      api_key = api_key,
+      format = "json",
+      nojsoncallback = 1,
+      bbox = bbox,
+      text = search_text,
+      page = p,
+      per_page = 500,
+      min_taken_date = min_date,
+      max_taken_date = max_date,
+      sort = "date-taken-desc",
+      extras = "geo,date_taken,tags"))
+    
+    if (http_error(resp)) next
+    data <- fromJSON(content(resp, as = "text"))
+    park_photos[[p]] <- data$photos$photo
+    
+    Sys.sleep(runif(1, 0.5, 1.5))  # small random delay to avoid rate-limiting
+  }
+  
+  # Combine and format results
+  all_photos <- bind_rows(park_photos)
+  
+  if (nrow(all_photos) == 0) return(NULL)
+  
+  all_photos %>%
+    mutate(date = ymd(substr(datetaken, 1, 10)),
+           photo_url = paste0("https://farm", farm, ".staticflickr.com/", server, "/", id, "_", secret, ".jpg"),
+      park = park_name)
+}
+
+
+
+# Run in parallel over all parks
+all_parks_photos <- future_map(
+  split(parks_df, seq_len(nrow(parks_df))),
+  fetch_photos_for_park,
+  .progress = TRUE)
+
+# Remove NULLs (failed parks)
+all_parks_photos <- compact(all_parks_photos)
+
+# Combine into single dataframe
+photos_df_all <- bind_rows(all_parks_photos)
+
+
+## this has just 2021-2023 data in it  (was photos_df_all_20212023.csv)
+#write.csv(photos_df_all, "data/raw/recreation/flickr/flickr_21to23_nondistinct.csv", row.names = FALSE)
+
+## old fnction had different dates this was 2025-2021 (was "photos_df_all_20250831.csv")
+#write.csv(photos_df_all, "data/raw/recreation/flickr/flickr_21to25_nondistinct.csv")
+
+# ^^^ bc flickr goes backwards it selects photos from most recent year and goes down until it hits its limit
+```
+
+b. Wrangle data
+```{r}
+# just select 2024 data and keep only distinct observations
+flickr_distinct_2024 <- read.csv("data/raw/recreation/flickr/flickr_21to25_nondistinct.csv") %>% 
+  mutate(year = as.numeric(substr(date, 1, 4)),
+          month = as.numeric(substr(date, 6, 7))) %>% 
+  #distinct(park,date , owner, .keep_all = TRUE) %>% # 25,868 × 28 %>% # was month
+  dplyr::select(park, year, month, date, latitude, longitude, owner) %>% 
+   filter(year == 2024) # 47,398
+
+
+## select distinct photos from 2023 to 2021
+ flickr_distinct_20212023 <- read.csv("data/raw/recreation/flickr/flickr_21to23_nondistinct.csv") %>% 
+  mutate(year = as.numeric(substr(date, 1, 4)),
+          month = as.numeric(substr(date, 6, 7))) %>% 
+  #distinct(park, date, owner, .keep_all = TRUE) %>% # 25,868 × 28 %>%  # was month
+  dplyr::select(park, year, month, date, latitude, longitude, owner) 
+
+ 
+# combine distinct flickr data
+flickr_distinct_20212024 <- rbind(flickr_distinct_20212023, flickr_distinct_2024) #175,472
+
+#write.csv(flickr_distinct_20212024, file = "data/processed/flickr_21to24_notdistinct.csv") # omitted _date when it was month
+
+
+```
+
+c. Format flickr data for final dataset
+```{r}
+flickr_distinct_20212024_calc <- flickr_distinct_20212024 %>% 
+  mutate(date = ymd(date)) %>% 
+  distinct(park, date, owner, .keep_all = TRUE)  %>% 
+  group_by(park, year, month, date) %>% 
+  summarise(daily_uniqueusers = n(), .groups = "drop") %>% 
+  group_by(park, year, month) %>% 
+  summarise(monthly_usertotal = sum(daily_uniqueusers), .groups = "drop") %>% 
+  group_by(park, month) %>% 
+  summarise(mean_monthly_usertotal = mean(monthly_usertotal), .groups = "drop") %>% 
+    filter(grepl(" SP", park) |
+           grepl(" SRA", park) |
+           grepl(" SB", park) |
+           grepl(" SNR", park) |
+           grepl(" SW", park)) %>% 
+  rename(UNITNAME = park)
+
+
+## make sure every park has months 1-12
+flickr_distinct_20212024_df <- flickr_distinct_20212024_calc %>% 
+  complete(UNITNAME, month = 1:12, fill = list(mean_monthly_usertotal = 0)) %>% 
+  rename(flickr_monthly_uniquetotals = mean_monthly_usertotal)
+
+#write.csv(flickr_distinct_20212024_df, file = "data/processed/flickr_21to24_distinct_v2.csv") 
+
+```
+
+
+#Meta
+(this format is a bit different)
+
+a. (step 1) Set up parameters, population data
+```{r}
+## upload population data
+# population raster from GPW (others will have to change path)
+gpw_path <- "data/raw/humanpop_count/gpw_v4_population_count_rev11_2015_2pt5_min.tif"
+gpw <- rast(gpw_path)
+
+
+## set up parameters
+# CA bounding box
+lat_min <- 32.3
+lat_max <- 42.1
+lon_min <- -125
+lon_max <- -114
+
+# tile zoom level
+zoom <- 13
+
+```
+
+b. (step 2) Set up google drive permission/file paths
+```{r}
+## authenticates session (will pop up in browser)
+drive_auth(cache = FALSE, scopes = "https://www.googleapis.com/auth/drive")
+
+# my specific google drive folder (others will need to change)
+folder_id <- "1bIdZiuj5GOXgti4_DE-Qs9cvp9voL0vj"
+
+# create temp folder for csv downloads
+csv_temp_dir <- "D:/meta_csvs"
+dir.create(csv_temp_dir, recursive = TRUE, showWarnings = FALSE)
+
+
+# create output folder for processed tiles (per-csv) 
+output_folder <- "data/processed/ca_activity_tiles"
+dir.create(output_folder, recursive = TRUE, showWarnings = FALSE)
+```
+
+c. (step 3) write helper functions
+```{r}
+#### function 1
+## meta gave lat/lon but need to put these into tiles for visitation/aggregation
+# convert lon/lat to tile numbers (formula comes from slippy map tiling)
+# Web mercator tile indicies
+lonlat_to_tile <- function(lon, lat, zoom) {
+  n <- 2^zoom
+  xtile <- floor((lon + 180) / 360 * n)
+  ytile <- floor((1 - log(tan(lat*pi/180) + 1/cos(lat*pi/180))/pi)/2 * n)
+  list(x = xtile, y = ytile)
+  }
+
+#### function 2
+# convert tile numbers to bounding box in lon/lat
+# (need to do this to create polyfons for sf objects)
+tile_to_bbox <- function(xtile, ytile, zoom) {
+  n <- 2^zoom
+  lon_min <- xtile / n * 360-180
+  lon_max <- (xtile + 1) / n * 360 - 180
+  lat_rad <- function(y) atan(sinh(pi*(1 - 2*y/n)))
+  lat_min <- lat_rad(ytile + 1) * 180 / pi
+  lat_max <- lat_rad(ytile) * 180 / pi
+  list(xmin = lon_min, xmax = lon_max, ymin = lat_min, ymax = lat_max)
+  }
+
+
+```
+
+
+d. (step 4) write csv processing function
+- filter for CA & daytime activity
+- round home coordinates to reduce duplicates
+- extract population at each home location (w/ GPW raster)
+- calculate population weighted activity (home pop x visit fract)
+- aggregate weighted activity by 3-week period (per csv)
+- convert visit points to tiles with weighted activity values
+- create polygons for each tile and attach weighted activity values
+- return sf collection of tile polygons with activity per 3wk record
+```{r}
+## i am processing 1 csv at a time to not blow up my computer
+# (by 'record' i mean individual csv in Gdrive)
+
+process_csv_file_by_record <- function(csv_path) {
+  message("reading csv: ", csv_path)
+  dt <- fread(csv_path) # reads csv into memory
+  
+  ## filter to CA & daytime visits
+  dt <- dt %>% 
+    filter(visit_latitude >= lat_min & visit_latitude <= lat_max,
+           visit_longitude >= lon_min & visit_longitude <= lon_max,
+           day_or_night == "daytime") # would change this for heat xtreme project
+  
+  if(nrow(dt) == 0) {
+    message("no ca daytime records in this file")
+    return(NULL)}
+  
+  ## round home coords to reduce duplicates/easier raster lookjups
+  dt <- dt %>% 
+    mutate(home_lat_round = round(home_latitude, 5), # ~ 1m precision
+           home_lon_round = round(home_longitude, 5))
+  
+  ## extract home population 
+  home_sf <- dt %>% 
+    distinct(home_lat_round, home_lon_round) %>% # extract only 1 home location
+    st_as_sf(coords = c("home_lon_round", "home_lat_round"), crs = 4326) 
+  
+  home_sf_proj <- st_transform(home_sf, crs(gpw)) %>% # make sure crs the same
+    mutate(home_lon_round = st_coordinates(.)[,1],
+           home_lat_round = st_coordinates(.)[,2])
+  
+  # extract population counts per home location
+  home_sf_proj$home_population <- terra::extract(gpw, vect(home_sf_proj))[,2] 
+  home_df <- st_drop_geometry(home_sf_proj) # make plain data frame for joining
+  
+  # join home pop back to original visits & create pop-weighted activity
+  dt <- dt %>% 
+    left_join(home_df, by = c("home_lat_round", "home_lon_round")) %>% 
+    mutate(home_population = ifelse(is.na(home_population), 0, home_population),
+           weighted_activity = home_population * visit_fraction)
+  
+  
+  ### 3a. aggregate grid by 3-week record (1 csv observation)
+  dt <- dt %>% 
+    mutate(record_start = as.Date(ds), # meta calls ds = date
+           record_week = ceiling((yday(record_start) %% 365) / 21)) #3wk bins
+  
+  # aggregate by visit pixel by record/csv
+  activity_summary <- dt %>% 
+    mutate(visit_lat_round = round(visit_latitude, 5),
+           visit_lon_round = round(visit_longitude, 5)) %>% 
+    group_by(visit_lat_round, visit_lon_round, record_start) %>% 
+    summarise(total_weighted_activity = sum(weighted_activity, na.rm = TRUE), .groups = "drop")
+  
+  ### 3b. convert to tiles
+  # convert visit coords to tile indices
+  tile_df <- activity_summary %>% 
+    rowwise() %>% 
+    mutate(tile = list(lonlat_to_tile(visit_lon_round, visit_lat_round, zoom))) %>% 
+    mutate(xtile = tile$x, ytile = tile$y) %>% 
+    ungroup()
+  
+  # aggregate all pixel activity within the same tile and record/csv
+  tile_activity <- tile_df %>% 
+    group_by(xtile, ytile, record_start) %>% 
+    summarise(activity = sum(total_weighted_activity, na.rm = TRUE, .groups = "drop"))
+  
+  ### 3c. build polygons for each tile
+  polygon_list <- purrr::pmap(
+    list(tile_activity$xtile, tile_activity$ytile),
+    function(x, y) {
+      bb <- tile_to_bbox(x, y , zoom)
+      st_polygon(list(matrix(c(bb$xmin, bb$ymin,
+                               bb$xmax, bb$ymin,
+                               bb$xmax, bb$ymax,
+                               bb$xmin, bb$ymax,
+                               bb$xmin, bb$ymin),
+                             ncol = 2, byrow = TRUE)))})
+  
+  # combine tile indices, activity value and geometry and return SF object 
+  tile_activity_sf <- st_sf(tile_activity, geometry = st_sf(polygon_list, crs = 4326))
+  
+  return(tile_activity_sf)
+  
+ }
+
+```
+
+e. (step 5) loop over all csvs
+```{r}
+# list all csvs in Gdrive
+folder <- drive_get(as_id(folder_id))
+csv_files <- drive_ls(folder, pattern = "\\.csv$")
+# fix file names meta gave me bc they break my code w/ all the spaces
+csv_files$name <- str_replace_all(csv_files$name, "[[:space:]]+", "_") 
+
+# download 1 csv at a time to avoid memory issues
+for(i in seq_len(nrow(csv_files))) {
+  csv_id <- csv_files$id[i]
+  csv_name <- csv_files$name[i]
+  local_file <- file.path(csv_temp_dir, csv_name)
+  
+  # make it check
+  message("downloading: ", csv_name)
+  drive_download(as_id(csv_id), path = local_file, overwrite = TRUE)
+  
+  # process each csv per record/3wk tile
+  tile_sf <- process_csv_file_by_record(local_file)
+  
+  # saves 1 shapefile per csv (there's about ~ 148 csv) - i would do this differentlty next time
+  if(!is.null(title_sf)) {
+    out_file <- file.path(output_folder, paste0(tools::file_path_sans_ext(csv_name), "_tiles.shp"))
+    st_write(tile_sf, out_file, delete_layer = TRUE)}
+  
+  # deletes csv and runs gc to keep disk usage low
+  file.remove(local_file)
+  gc()
+  
+}
+
+```
+
+f. (step 6) save files
+```{r}
+# format it
+tile_files <- list.files(output_folder, pattern = "\\.shp$", full.names = TRUE)
+all_tiles_sf <- map(tile_files, st_read) %>% bind_rows()
+
+
+## option 1. save as geopackage since i already downloaded indiviaul .shps
+# this will be full data to refer back to
+st_write(all_tiles_sf, "data/processed/ca_activity_tiles.gpkg", layer = "all_records", delete_layer = TRUE)
+
+
+
+## option 2. save just attributes to make aggregation quicker
+tile_attributes <- all_tiles_sf %>% 
+  st_drop_geometry() %>% 
+  dplyr::select(xtile, ytile, rcrd_st, activty)
+
+# save as Parquet for faster storage
+write_parquet(tile_attributes, "data/processed/ca_tiles_attributes.parquet")
+
+
+```
+
+e. (step 7) aggregate it to desired AOIs/time scale
+
+- aggregate to ZIP code (annual)
+```{r}
+## reupload the meta data
+all_tiles_sf <- st_read("data/processed/ca_activity_tiles.gpkg", layer = "all_records")
+# change the name
+names(all_tiles_sf)[names(all_tiles_sf) == "activty"] <- "activity"
+
+## reupload zipcode data from LDI
+ldi <- st_read("data/raw/LD_incidence/CA_Zips_Lyme_NAD83.shp")
+st_crs(ldi) # EPSG:3310 - NAD83 (this is in meters not lat/lonlike WGS84/EPSG 4326)
+
+## transform meta activity tiles to match ZIP CRS
+all_tiles_sf_83 <- st_transform(all_tiles_sf, st_crs(ldi))
+
+# to just produce table (not raster)
+zip_activity_sf <- st_join(ldi, all_tiles_sf_83, join = st_intersects)
+
+# aggreage activity per zip per record (3wk period)
+zip_activity_annual_agg <- zip_activity_sf %>% 
+  st_drop_geometry() %>% 
+  group_by(ZIP_CODE) %>% #, rcrd_st
+  summarise(total_activity = sum(activity, na.rm = TRUE), .groups = "drop")
+
+write.csv(zip_activity_annual_agg, file = "data/processed/meta_annual_zip.csv")
+
+```
+
+- aggregate to park/CASP (annual)
+```{r}
+# from datacleaning 
+#casp_shp_clean <- casp_shp_select_crs %>% 
+#  dplyr::select(UNITNAME, Shape_Area, field_divi, district, geometry) 
+
+## transform meta activity tiles to match CASP 
+all_tiles_sf_83_casp <- st_transform(all_tiles_sf, st_crs(casp_shp_clean))
+
+# to just produce table (not raster)
+casp_activity_sf <- st_join(casp_shp_clean, all_tiles_sf_83_casp, join = st_intersects)
+
+# aggreage activity per zip per record (3wk period)
+casp_activity_annual_agg <- casp_activity_sf %>% 
+  st_drop_geometry() %>% 
+  group_by(UNITNAME) %>% #, rcrd_st
+  summarise(total_activity = sum(activity, na.rm = TRUE), .groups = "drop")
+
+write.csv(casp_activity_annual_agg, file = "data/processed/meta_annual_casp.csv")
+
+
+```
+
+Assign CASP to zipcode
+```{r}
+ldi_valid <- st_make_valid(ldi)
+casp_shp_clean_valid <- st_make_valid(casp_shp_clean)
+
+
+ldi_buffer <- st_buffer(ldi_valid, 0)
+casp_shp_buffer <- st_buffer(casp_shp_clean_valid, 0)
+
+st_crs(ldi_buffer) #NAD83 
+st_crs(casp_shp_buffer) #"WGS 84"
+
+casp_shp_buffer <- st_transform(casp_shp_buffer, st_crs(ldi_buffer))
+
+casp_zip_int <- st_intersection(casp_shp_buffer, ldi_buffer) %>% 
+  mutate(int_area = as.numeric(st_area(geometry)))
+
+casp_zip_int2 <- casp_zip_int %>% 
+  group_by(UNITNAME) %>% 
+  slice_max(int_area, n = 1, with_ties = FALSE) %>% 
+  ungroup()
+
+#casp_shp_clean <- casp_shp_clean %>% 
+#  left_join(casp_zip_int2 %>% 
+#              st_drop_geometry() %>% dplyr::select(UNITNAME, ZIP_CODE), by = "UNITNAME")
+
+# check
+casp_zip_int2  %>% 
+  group_by(UNITNAME) %>% 
+  mutate(pct = int_area / sum(int_area)) %>% 
+  arrange(desc(pct)) %>%
+  slice(1) %>%
+  summary()
+```
+
+
+Add casp & zip total annual activity to ("data/processed/casp_ldi_tick_annualmonthly.csv")
+```{r}
+data_clean_analysis <- read.csv("data/processed/casp_ldi_tick_annualmonthly.csv") %>% 
+  left_join(casp_activity_annual_agg, by = "UNITNAME") %>% 
+  rename(activity_annualtotal_incasp = total_activity) %>% 
+  left_join(casp_zip_int2 %>% # did this calculation above 
+              st_drop_geometry() %>% dplyr::select(UNITNAME, ZIP_CODE), by = "UNITNAME") %>% 
+  left_join(zip_activity_annual_agg, by = "ZIP_CODE") %>% 
+  rename(activity_annualtotal_inzip = total_activity) %>% 
+  dplyr::select(UNITNAME, 
+                field_divi, district, ZIP_CODE,
+                dist_coast_km,
+                activity_annualtotal_incasp, activity_annualtotal_inzip,
+                ldi_year_weightedavg_casp, 
+                tick_year_inf,
+                tick_year_presence,
+                tick_month_presence_Jan:tick_month_presence_Dec) 
+
+
+#write.csv(data_clean_analysis, file = "data/processed/data_clean_analysis.csv", row.names = FALSE)
+```
+
+
+
+
+
+(quick visualization)
+```{r}
+library(leaflet)
+library(sf)
+library(viridisLite)
+ca_shp <- counties(state = "CA", cb = TRUE, class = "sf")
+
+all_tiles_sf_agg <- all_tiles_sf %>% 
+  group_by(geom) %>% #xtile, ytile
+  summarise(activity = mean(activity , na.rm = TRUE), .groups = "drop")
+
+
+all_tiles_sf_agg <- st_transform(all_tiles_sf_agg, st_crs(casp_shp_clean))
+
+all_tiles_ca <- st_intersection(
+  all_tiles_sf_agg,
+  st_make_valid(casp_shp_clean))
+
+
+all_tiles_ca <- st_transform(all_tiles_ca, 4326)
+casp_shp_clean      <- st_transform(casp_shp_clean, 4326)
+
+pal <- colorNumeric(
+  palette = viridis(256, option = "mako", direction = -1),
+  domain  = log(all_tiles_ca$activity+1),
+  na.color = "#f2f2f2")
+
+leaflet(options = leafletOptions(preferCanvas = TRUE)) %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  
+  addPolygons(
+    data = all_tiles_ca,
+    fillColor   = ~pal(log(activity+1)),
+    fillOpacity = 0.9,
+    color       = NA,
+    weight      = 0
+  ) %>%
+  
+  addPolygons(
+    data = casp_shp_clean,
+    fill = FALSE,
+    color = "black",
+    weight = 1
+  ) %>%
+  
+  addLegend(
+    pal = pal,
+    values = log(all_tiles_ca$activity+1),
+    title = "Activity",
+    position = "bottomright"
+  )
+```
+
+Make monthly dataset with park info and monthly activity data
+(avg monthly activity per park)
+
+```{r}
+## check how i set up flickr , gbif
+flickr <- read.csv("data/processed/flickr_21to24_distinct_v2.csv")
+gbif <- read.csv("data/processed/gbif_distinct_20212023.csv")
+
+
+## fix meta to monthly agg
+# aggreage activity per zip per record (3wk period)
+casp_activity_monthly_agg <- casp_activity_sf %>% 
+  st_drop_geometry() %>% 
+  mutate(month = as.integer(lubridate::month(rcrd_st))) %>% 
+  group_by(UNITNAME, month) %>% 
+  summarise(total_activity = sum(activity, na.rm = TRUE), .groups = "drop") %>% 
+  tidyr::complete(UNITNAME, month = 1:12, fill = list(total_activity = 0)) %>% 
+  mutate(meta_monthly_uniquetotals = total_activity)
+
+  
+activity_monthly_casp <- casp_activity_monthly_agg %>% dplyr::select(-total_activity) %>% 
+  left_join(flickr %>% dplyr::select(-X), by = c("UNITNAME", "month")) %>% 
+  left_join(gbif %>% dplyr::select(-X), by = c("UNITNAME", "month")) %>% 
+  tidyr::complete(UNITNAME, month = 1:12, fill = list(gbif_monthly_uniquetotals = 0))
+
+#write.csv(activity_monthly_casp, file = "data/processed/activity_monthlytotalraw_casp.csv", row.names = FALSE)
+  
+```
+
+calculate proportions of social media visits to CASP annual visits
+(need to create the proportional visitors based on CASp yearly totals)
+```{r}
+# Load annual CASP totals
+casp_year_total <- read.csv("data/processed/casp_year_totalvisitors.csv") %>% dplyr::select(-X)
+
+activity_long <- activity_monthly_casp %>%
+  pivot_longer(
+    cols = c(flickr_monthly_uniquetotals, gbif_monthly_uniquetotals, meta_monthly_uniquetotals),
+    names_to = "source",
+    values_to = "monthly_total")
+
+# Calculate monthly proportions per source
+monthly_props <- activity_long %>%
+  group_by(UNITNAME, source) %>%
+  mutate(annual_total = sum(monthly_total, na.rm = TRUE),
+    monthly_prop = ifelse(annual_total == 0, 0, monthly_total / annual_total)) %>%
+  ungroup()
+
+monthly_props_wide <- monthly_props %>% pivot_wider(id_cols = c(UNITNAME, month), names_from = source, values_from = monthly_prop) %>% 
+  rename_with(~ gsub("_monthly_uniquetotals$", "_monthly_prop", .x), .cols = ends_with("_monthly_uniquetotals")) 
+  
+#write.csv(monthly_props_wide, file = "data/processed/activity_monthly_sourceprops_wide.csv", row.names = FALSE)
+
+
+# Average monthly proportion across sources and normalize
+avg_monthly_props <- monthly_props %>%
+  complete(UNITNAME, month = 1:12, fill = list(monthly_prop = 0)) %>%
+  group_by(UNITNAME, month) %>%
+  summarise(avg_monthly_prop = mean(monthly_prop, na.rm = TRUE), .groups = "drop") %>%
+  group_by(UNITNAME) %>%
+  mutate(avg_monthly_prop = avg_monthly_prop / sum(avg_monthly_prop)) %>%
+  ungroup()
+
+# Join with annual CASP totals to estimate monthly visits
+monthly_estimated_visits <- casp_year_total %>%
+  select(UNITNAME, casp_year_meantotal) %>%
+  crossing(month = 1:12) %>%
+  left_join(avg_monthly_props, by = c("UNITNAME", "month")) %>%
+  mutate(
+    monthly_estimated_visits = casp_year_meantotal * avg_monthly_prop,
+    monthly_estimated_visits = ifelse(is.na(monthly_estimated_visits), 0, monthly_estimated_visits)) %>%
+  select(UNITNAME, month, casp_year_meantotal, monthly_estimated_visits,  avg_monthly_prop) %>%   # 462 original parks
+          filter(grepl(" SP", UNITNAME) |
+           grepl(" SRA", UNITNAME) |
+           grepl(" SB", UNITNAME) |
+           grepl(" SNR", UNITNAME) |
+           grepl(" SW", UNITNAME))
+
+monthly_estimated_visits %>% 
+  group_by(UNITNAME) %>% 
+  summarise(check_sum = sum(avg_monthly_prop))
+# avg_monthly_prop = normalized monthly proportion of park activity, averaged across all sources (Flickr, GBIF, metadata).
+# monthly_estimated_visits = estimated number of visitors per month scaled by casp_year_mean_total
+
+monthly_estimated_visits %>% left_join(casp_shp_clean %>% st_drop_geometry(), by = "UNITNAME") %>% 
+  dplyr::select(UNITNAME, field_divi, district, ZIP_CODE, month, casp_year_meantotal, monthly_estimated_visits, avg_monthly_prop) %>% 
+  as.data.frame() #%>% 
+  # write.csv(file = "data/processed/activity_monthlyestimates_casp.csv", row.names = FALSE)
+```
+could i combine with monthly tick suitability
+```{r}
+data_clean_analysis_monthly <- monthly_estimated_visits %>% left_join(casp_shp_clean %>% st_drop_geometry(), by = "UNITNAME") %>% 
+  dplyr::select(UNITNAME, field_divi, district, ZIP_CODE, month, casp_year_meantotal, monthly_estimated_visits, avg_monthly_prop) %>% 
+  as.data.frame() %>% 
+  group_by(UNITNAME, month) %>% 
+  distinct(.keep_all = TRUE) %>% 
+  left_join(data_clean_analysis, by = c("UNITNAME", "ZIP_CODE","field_divi", "district"))
+
+#write.csv(data_clean_analysis_monthly, file = "data/processed/data_clean_analysis_monthly.csv", row.names = FALSE)
+
+
+
+test <- data_clean_analysis_monthly %>% 
+  dplyr::select(UNITNAME, tick_month_presence_Jan:tick_month_presence_Dec) %>% 
+  pivot_longer(cols = c(tick_month_presence_Jan:tick_month_presence_Dec),
+    names_to = "month_name",
+    values_to = "tick_month_presence") %>%  
+  mutate(month_name = str_remove(month_name, "tick_month_presence_"),
+         month = match(month_name, month.abb)) %>% 
+  dplyr::select(UNITNAME, month, tick_month_presence) %>% 
+  distinct(UNITNAME, month, .keep_all = TRUE) %>% 
+  left_join(data_clean_analysis_monthly , by = c("UNITNAME", "month")) %>% 
+  dplyr::select(-c(tick_month_presence_Jan:tick_month_presence_Dec)) %>% 
+  #write.csv(file = "data/processed/data_clean_analysis_monthly_long.csv", row.names = FALSE)
+  mutate(visits_scaled = monthly_estimated_visits / max(monthly_estimated_visits),
+         monthly_index = tick_month_presence*visits_scaled) %>% 
+  arrange(desc(monthly_index)) %>% 
+  left_join(casp_shp_clean_valid, by = "UNITNAME") %>% 
+  st_as_sf()
+
+
+```
+
+
+```{r}
+test2 <- read.csv("data/processed/data_clean_analysis_monthly.csv")
+
+
+## District (n = 21)
+base_palette <- paletteer_d("ggthemes::manyeys", n = 19)#$colors
+extended_palette <- c(base_palette,"#F4C2C2","#F0E5D8")#,"#F9D5B1")# "#E3CFC4" , "beige") #"#7F3C8D"
+
+
+
+test2 %>% 
+  filter(!is.na(district)) %>% 
+ggplot(aes(x = casp_year_meantotal, y = monthly_estimated_visits)) +
+  geom_point(aes(color = district), alpha = .7) +
+  geom_smooth(color = "black") +
+  theme_classic() +
+  #scale_x_continuous(expand = c(0,0.7)) +
+  scale_y_continuous(expand = c(0,.5)) +
+  labs(x = "CASP Annual Totals", y = "Social Media Annual Totals", color = "District") +
+  theme(legend.title = element_text(face = "bold")) +
+  scale_color_manual(values = extended_palette ) +
+  theme(
+    plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.y = element_text(size = 16),
+    axis.text.x = element_text(size = 16))
+
+ggsave()
+```
+
+correlation betwen monthly users and source
+```{r}
+test3 <- read.csv("data/processed/activity_monthly_sourceprops_wide.csv")
+park_info <- test2 %>% 
+  group_by(UNITNAME, district) %>% 
+  slice(1) %>% 
+  dplyr::select(UNITNAME, district, ZIP_CODE)
+
+test3 %>% 
+  left_join(park_info) %>% 
+  filter(!is.na(district)) %>% 
+  #filter(meta_monthly_prop < .3) %>% 
+  ggplot(aes(x = meta_monthly_prop, y = flickr_monthly_prop)) + #meta_monthly_prop gbif_monthly_prop
+  geom_point(aes(color = district), alpha = .7) +
+  #geom_smooth(color = "black") +
+  theme_classic() +
+  labs(x = "Meta Monthly Prop.", y = "Non-Meta Monthly Prop.", color = "District") +
+  theme(legend.title = element_text(face = "bold")) +
+  scale_color_manual(values = extended_palette ) +
+  theme(
+    plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.y = element_text(size = 16),
+    axis.text.x = element_text(size = 16)) +
+  scale_x_continuous(trans = "sqrt") +
+  scale_y_continuous(trans = "sqrt")
+
+test3 %>% 
+  left_join(park_info) %>% 
+  filter(!is.na(district)) %>% 
+  #filter(meta_monthly_prop < .3) %>% 
+  ggplot(aes(x = meta_monthly_prop, y = gbif_monthly_prop)) + #meta_monthly_prop 
+  geom_point(aes(color = district), alpha = .7) +
+  geom_smooth(color = "black", method = "lm") +
+  theme_classic() +
+  labs(x = "Meta Monthly Prop.", y = "Non-Meta Monthly Prop.", color = "District") +
+  theme(legend.title = element_text(face = "bold")) +
+  scale_color_manual(values = extended_palette ) +
+  theme(
+    plot.margin = margin(t = 1, r = 0, b = 0, l = 0),
+    axis.title = element_text(face = "bold", size = 18),
+    axis.text.y = element_text(size = 16),
+    axis.text.x = element_text(size = 16)) +
+  scale_x_continuous(trans = "sqrt") +
+  scale_y_continuous(trans = "sqrt")
+  
+
+
+cor.test(test3$meta_monthly_prop, test3$gbif_monthly_prop, method = "spearman")
+# S = 3.023e+09, p-value = 0.001098 rho = 0.06296052 
+
+cor.test(test3$meta_monthly_prop, test3$flickr_monthly_prop, method = "spearman")
+#S = 2811738583, p-value = 8.338e-07 rho = 0.09550599 
+```
+

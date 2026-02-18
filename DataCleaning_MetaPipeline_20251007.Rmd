@@ -1,0 +1,251 @@
+---
+title: "Meta pipeline (new)"
+output: html_document
+date: "2025-10-07"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+meta activity values are normalized per home pixel so to get actual visitation, you need to multiple each visit fraction by the population of home pixel
+
+
+
+Step 1. Pull down, filter, and wrangle individual csvs
+```{r}
+## set up params
+chunk_size <- 500000 # number of lines to read in per chunk (helps with memory)
+input_file <- "data/raw/recreation/meta/activitymaps/activity_space_distributions_20250908_us1.csv"
+output_file <- "data/processed/meta_activitymaps_us1_20251007.csv"
+
+# filter for california (currently this is all of US)
+# looked at casp_shp_bbox and added + 0.2
+lat_min <- 32.3 
+lat_max <- 42.1
+lon_min <- -125 # western boundary
+lon_max <- -114 # eastern boundary
+
+# choose zoom level (larger zoom values = smaller tiles)
+zoom <- 13 # may fiddle with this (10 is way too coarse for me)
+
+## deleting exisiting output file (helps memory)
+# initial output - makes we we dont append to old runs results
+if(file.exists(output_file)) file.remove(output_file)
+
+## read and filter csv into chunks
+con <- file(input_file, "r") # open connection to large csv
+header <- readLines(con, n = 1) # read first line w/header
+
+## process the csv in chunks (helps memory)
+while(length(chunk_lines <- readLines(con, n = chunk_size)) > 0 ) {
+  
+  # combine header with current chunk lines for data table
+  chunk <- fread(paste(c(header, chunk_lines), collapse = "\n"))
+  
+  # filter chunk for rows that fall within CA boundary
+  chunk[
+    visit_latitude >= lat_min & visit_latitude <= lat_max &
+      visit_longitude >= lon_min & visit_longitude <= lon_max
+  ][
+    , fwrite(.SD, output_file, append = TRUE) # write only filtered data
+  ]
+}
+
+close(con) # close file connection
+
+# load filtered data into memory (vs load in full lg csv)
+ca_data_1 <- fread(output_file) # read.csv("data/processed/meta_activitymaps_us1_20251007.csv")
+#ca_data_2 <- fread(output_file) # "data/processed/meta_activitymaps_us2_20251007.csv"
+
+ca_data_1 <- fread(output_file) #read.csv("data/processed/meta_activitymaps_us1_20251007.csv")
+#ca_data_2 <- fread("data/processed/meta_activitymaps_us2_20251007.csv")
+
+
+```
+
+join home population density
+```{r}
+gpw <- rast("data/raw/gpw-v4-population-density-rev11_2020_30_sec_asc/gpw_v4_population_density_rev11_2020_30_sec_1.asc")
+
+## for ca 1
+home_coords1 <- ca_data_1 %>%
+  filter(day_or_night == "daytime") %>%
+  distinct(home_latitude, home_longitude) %>%
+  mutate(home_lat_round = round(home_latitude, 5),
+         home_lon_round = round(home_longitude, 5))
+
+
+home_sf1 <- home_coords1 %>% 
+  st_as_sf(coords = c("home_lon_round", "home_lat_round"), crs = 4326) 
+
+
+home_sf_proj1 <- st_transform(home_sf1, crs(gpw))
+
+
+# Extract population
+home_sf_proj1$home_population <- terra::extract(gpw, vect(home_sf_proj1))[,2]
+
+
+### for ca 2
+home_coords2 <- ca_data_2 %>%
+  filter(day_or_night == "daytime") %>%
+  distinct(home_latitude, home_longitude) %>%
+  mutate(home_lat_round = round(home_latitude, 5),
+         home_lon_round = round(home_longitude, 5))
+
+
+home_sf2 <- home_coords2 %>% 
+  st_as_sf(coords = c("home_lon_round", "home_lat_round"), crs = 4326) 
+
+
+home_sf_proj2 <- st_transform(home_sf2, crs(gpw))
+
+
+# Extract population
+home_sf_proj2$home_population <- terra::extract(gpw, vect(home_sf_proj2))[,2]
+
+```
+
+now add home pop and summarize
+
+
+```{r}
+ca_data_1 <- ca_data_1 %>% 
+  left_join(home_sf_proj1, by = c("home_latitude", "home_longitude")) %>% 
+  mutate(home_population = ifelse(is.na(home_population), 0, home_population),
+         weighted_activity = home_population*visit_fraction)
+
+
+ca_data_2 <- ca_data_2 %>% 
+  left_join(home_sf_proj2, by = c("home_latitude", "home_longitude")) %>% 
+  mutate(home_population = ifelse(is.na(home_population), 0, home_population),
+         weighted_activity = home_population*visit_fraction)
+
+
+## summmarize each visit pixel
+activity_summary_1 <- ca_data_1 %>% 
+  group_by(visit_latitude, visit_longitude) %>% 
+  summarise(total_weighted_activity = sum(weighted_activity, na.rm = TRUE), .groups = "drop")
+
+
+activity_summary_2 <- ca_data_2 %>% 
+  group_by(visit_latitude, visit_longitude) %>% 
+  summarise(total_weighted_activity = sum(weighted_activity, na.rm = TRUE), .groups = "drop")
+
+## combine and collapse to unique visit pixels
+activity_summary_12  <- bind_rows(activity_summary_1, activity_summary_2) %>% 
+  group_by(visit_latitude, visit_longitude) %>% 
+  summarise(total_weighted_activity = sum(total_weighted_activity, na.rm = TRUE), .groups = "drop") # 9224
+
+```
+
+
+visualize
+
+```{r}
+activity_sf <- st_as_sf(
+  activity_summary_2,
+  coords = c("visit_longitude", "visit_latitude"),
+  crs = 4326)
+
+pal <- colorNumeric(
+  palette = "YlOrRd",  # You can change this to "Viridis", "Blues", etc.
+  domain = log(activity_sf$total_weighted_activity+1),
+  na.color = "transparent",
+  reverse = FALSE) 
+
+leaflet(activity_sf) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    radius = 5,
+    fillColor = ~pal(log(total_weighted_activity+1)),
+    fillOpacity = 0.8,
+    color = "black",
+    weight = 0.2,
+    popup = ~paste0("Total Weighted Activity: ", round(total_weighted_activity, 2))
+  ) %>%
+  addLegend(
+    pal = pal,
+    values = ~log(total_weighted_activity+1),
+    title = "log(Pop-Weighted Activity+1)",
+    position = "bottomright"
+  )
+
+activity_summary_2
+
+activity_summary12 #16,934 × 3
+```
+
+convert back to tiles so there's more coverage
+```{r}
+## compute activity indices for each tile location
+tile_df <- activity_summary_12 %>% 
+  rowwise() %>% # need for lonlat_* since its returned as a list per row
+  mutate(tile = list(lonlat_to_tilenum(visit_longitude, visit_latitude, zoom))) %>% 
+  mutate(xtile = tile$x, ytile = tile$y) %>% # extract x & y index of tile
+  ungroup()
+
+## aggregate activity by tile 
+# remember i'm using max here but could be mean
+tile_activity <- tile_df %>% 
+  group_by(xtile, ytile) %>% 
+  summarise(activity = sum(total_weighted_activity), .groups = "drop")
+
+## compute bounding box for each tile
+# for each tile (xtile, ytile) comput its bbox in lat/lon coords
+bbox_df <- tile_activity %>% 
+  rowwise() %>% 
+  mutate(bbox = list(tile_bbox(xtile, ytile, zoom))) %>% 
+  mutate(lng1 = bbox$xmin, lng2 = bbox$xmax, # left/right longitudes
+         lat1 = bbox$ymin, lat2 = bbox$ymax) %>%  # bottom/top latitudes
+  ungroup()
+
+## create tile polygons
+# build each tile polygon using its 4 corners, and close it by repeating the first point
+polygon_list <- purrr::pmap(list(bbox_df$lng1, bbox_df$lng2, bbox_df$lat1, bbox_df$lat2),
+                            function(xmin, xmax, ymin, ymax) {
+                              st_polygon(list(matrix(c(
+                                 xmin, ymin, # bottom left
+                                 xmax, ymin, # bottom eirght
+                                 xmax, ymax, # top right
+                                 xmin, ymax, # top left
+                                 xmin, ymin), # close polygon
+                                 ncol = 2, byrow = TRUE)))
+                            })
+
+## create sf object
+# attach activity values & geometry into a spatial object
+tile_activity_sf <- st_sf(activity = bbox_df$activity,
+                          geometry = st_sfc(polygon_list, crs = 3857)) # check, but i thik tile_bbox gives web mercator coords
+
+# convert 3857 to 4326 for leaflet & downstream analysis
+tile_activity_lonlat <- st_transform(tile_activity_sf, crs = 4326)
+
+#activitymap_us1 <- tile_activity_lonlat # will switch this for the next csv
+ #activitymap_us2 <- tile_activity_lonlat
+activitymap_us12 <- tile_activity_lonlat
+
+activitymap_us12 <- activitymap_us12 %>% mutate(log_activity = log(activity+1))
+#st_write(activitymap_us12, "data/processed/meta_activitymaps_us12.shp")
+#st_write(activitymap_us1, "data/processed/meta_activitymaps_us1.shp") # i put these into folders _shp
+#st_write(activitymap_us2, "data/processed/meta_activitymaps_us2.shp")
+
+# create color scale
+pal <- colorNumeric("YlOrRd", domain = log(tile_activity_lonlat$activity+1), na.color = "transparent")
+
+## create leaflet map
+leaflet(tile_activity_lonlat) %>% 
+  addTiles() %>% 
+  addPolygons(fillColor = ~pal(log(activity+1)),
+              weight = 1, color = "black", fillOpacity = 0.7,
+              popup = ~paste0("log(Activity+1)", round(log(activity+1), 3))) %>% 
+  addLegend(pal = pal, values = ~log(activity+1), title = "log(Activity Level+1)", position = "bottomright")
+
+
+```
+
+
+NOW RERUN ALL ANALYSES AND FIGURES WITH THIS!!! EXTRACT LOG ACTIVITY TO PARK POLYGON
+
